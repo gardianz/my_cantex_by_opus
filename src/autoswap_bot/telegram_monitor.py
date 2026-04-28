@@ -123,6 +123,7 @@ class TelegramMonitor:
         self._session: aiohttp.ClientSession | None = None
         self._account_totals: dict[str, TelegramAccountTotals] = {}
         self._cards: dict[str, TelegramCardState] = {}
+        self._fee_oracle: Any | None = None
         self._terminal_logs: deque[str] = deque(
             maxlen=self.runtime.terminal_dashboard_logs_limit
         )
@@ -136,6 +137,10 @@ class TelegramMonitor:
         self._telegram_last_render_text: str | None = None
         self._telegram_last_publish_monotonic: float = 0.0
         self._publish_lock = asyncio.Lock()
+
+    def set_fee_oracle(self, oracle) -> None:
+        """Store a reference to the SharedFeeOracle for dashboard display."""
+        self._fee_oracle = oracle
 
     async def start(self) -> None:
         self._load_state()
@@ -346,6 +351,24 @@ class TelegramMonitor:
         card.fee_quote_history.append(fee_cc)
         if len(card.fee_quote_history) > max_history:
             card.fee_quote_history = card.fee_quote_history[-max_history:]
+
+    async def sync_fee_from_oracle(
+        self,
+        card: TelegramCardState | None,
+        oracle_fees: list[Decimal],
+        *,
+        max_history: int = 20,
+    ) -> None:
+        """Replace the card's fee_quote_history with data from the shared oracle.
+
+        Called by the bot to keep the dashboard in sync with the oracle's
+        centralized fee history instead of per-account polling data.
+        """
+        if card is None:
+            return
+        if not oracle_fees:
+            return
+        card.fee_quote_history = list(oracle_fees[-max_history:])
 
     async def record_tx_success(
         self,
@@ -681,6 +704,10 @@ class TelegramMonitor:
                 row_width,
             ),
             self._padded_line(
+                f"Fee oracle (live): {self._dashboard_oracle_fees_summary()}",
+                row_width,
+            ),
+            self._padded_line(
                 f"State: {self._dashboard_state_label(cards)}",
                 row_width,
             ),
@@ -702,6 +729,74 @@ class TelegramMonitor:
         if any(phase == "STARTING" for phase in phases):
             return "starting"
         return "live"
+
+    def _dashboard_oracle_fees_summary(self) -> str:
+        """Build a compact summary of current oracle fees for all pairs.
+
+        Shows both current fee and average fee.
+        Format: CC->U now=0.31 avg=0.30 | CC->B now=0.45* avg=0.42*
+        """
+        oracle = self._fee_oracle
+        if oracle is None:
+            return "not started"
+
+        pair_labels = {
+            ("CC", "USDCx"): "CC->U",
+            ("CC", "CBTC"): "CC->B",
+            ("USDCx", "CC"): "U->CC",
+            ("USDCx", "CBTC"): "U->B",
+            ("CBTC", "CC"): "B->CC",
+            ("CBTC", "USDCx"): "B->U",
+        }
+        fee_cap = self.runtime.max_network_fee_cc_per_execution
+        stability_samples = max(1, self.runtime.fee_stability_samples)
+        cap_text = f"{fee_cap}" if fee_cap is not None else "-"
+        parts: list[str] = []
+        for (sell, buy), label in pair_labels.items():
+            current = oracle.get_current_fee(sell, buy)
+            avg = oracle.get_avg_fee(sell, buy, stability_samples)
+            if current is None:
+                parts.append(f"{label} -")
+            else:
+                cur_text = format(current, ".4f").rstrip("0").rstrip(".")
+                cur_marker = "*" if fee_cap is not None and current > fee_cap else ""
+                if avg is not None:
+                    avg_text = format(avg, ".4f").rstrip("0").rstrip(".")
+                    avg_marker = "*" if fee_cap is not None and avg > fee_cap else ""
+                    parts.append(f"{label} {cur_text}{cur_marker}/avg {avg_text}{avg_marker}")
+                else:
+                    parts.append(f"{label} {cur_text}{cur_marker}")
+        return f"{' | '.join(parts)} (cap={cap_text})"
+
+    def _oracle_log_line(self) -> str | None:
+        """Build a log line from oracle data for the execution logs section."""
+        oracle = self._fee_oracle
+        if oracle is None:
+            return None
+
+        fee_cap = self.runtime.max_network_fee_cc_per_execution
+        if fee_cap is None:
+            return None
+
+        pair_labels = {
+            ("CC", "USDCx"): "CC->U",
+            ("CC", "CBTC"): "CC->B",
+            ("USDCx", "CBTC"): "U->B",
+            ("CBTC", "USDCx"): "B->U",
+        }
+        parts: list[str] = []
+        for (sell, buy), label in pair_labels.items():
+            current = oracle.get_current_fee(sell, buy)
+            if current is not None:
+                cur_text = format(current, ".4f").rstrip("0").rstrip(".")
+                status = "OK" if current <= fee_cap else "HIGH"
+                parts.append(f"{label}={cur_text} {status}")
+        if not parts:
+            return None
+
+        from datetime import datetime
+        ts = datetime.now().astimezone().strftime("%H:%M:%S")
+        return f"[{ts}] [oracle] {' | '.join(parts)} (cap={fee_cap})"
 
     def _dashboard_status(self, card: TelegramCardState) -> str:
         if card.phase == "WAITING":

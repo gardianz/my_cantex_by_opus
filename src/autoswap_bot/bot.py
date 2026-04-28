@@ -28,6 +28,7 @@ from cantex_sdk import (
 from .config import AccountConfig, BotConfig, PreparedAccountRun
 from .constants import CC_SYMBOL, MIN_TICKET_SIZE_CC, TRACKED_SYMBOLS, dust_for_symbol
 from .models import ActivitySummary, AccountResult, PlanIssue, RouteHop, RoutePlan
+from .fee_oracle import SharedFeeOracle
 from .routing import RouteOptimizer
 from .runtime_state import BotRuntimeStateStore, DailyFreeFeeStatus
 from .sdk_ext import ExtendedCantexSDK
@@ -99,20 +100,37 @@ class AutoswapBot:
             logging.getLogger("autoswap_bot.state"),
         )
         self._stop_requested = asyncio.Event()
+        self.fee_oracle = SharedFeeOracle(
+            poll_interval_range=self.config.runtime.network_fee_poll_seconds_range,
+            fee_history_max=50,
+            rng=self._rng,
+        )
+        self.monitor.set_fee_oracle(self.fee_oracle)
+        self.fee_oracle.set_on_poll_callback(self._on_oracle_poll)
+
+    def _on_oracle_poll(self) -> None:
+        """Called by fee oracle after each poll cycle to refresh dashboard + add log."""
+        log_line = self.monitor._oracle_log_line()
+        if log_line is not None:
+            self.monitor._terminal_logs.append(log_line)
+        self.monitor._render_terminal_dashboard(force=True)
 
     async def request_stop(self) -> None:
         self._stop_requested.set()
+        await self.fee_oracle.stop()
 
     def stop_requested(self) -> bool:
         return self._stop_requested.is_set()
 
     async def run(self) -> list[AccountResult]:
         await self.monitor.start()
+        self.fee_oracle.start()
         try:
             return await asyncio.gather(
                 *(self._run_account(account) for account in self.config.accounts)
             )
         finally:
+            await self.fee_oracle.stop()
             await self.monitor.close()
 
     async def _run_account(self, account: AccountConfig) -> AccountResult:
@@ -255,6 +273,8 @@ class AutoswapBot:
 
                 admin = await sdk.get_account_admin()
                 instruments_by_symbol = self._resolve_instruments(admin.instruments, info)
+                # Register SDK with fee oracle (first account to auth wins)
+                self.fee_oracle.register_sdk(sdk, instruments_by_symbol)
                 router = RouteOptimizer(
                     sdk,
                     instruments_by_symbol,
@@ -2973,16 +2993,14 @@ class AutoswapBot:
             return current_route, None, None
 
         route = current_route
-        # --- FIX: Buffer fee history untuk deteksi stabilitas ---
-        fee_history: list[Decimal] = []
         stability_samples = max(1, self.config.runtime.fee_stability_samples)
+        oracle = self.fee_oracle
 
-        # Catat fee dari route awal ke history
-        for hop in route.hops:
-            if hop.network_fee_symbol == CC_SYMBOL:
-                fee_history.append(hop.network_fee_amount)
-                await self.monitor.update_fee_quote_history(monitor_card, hop.network_fee_amount)
-                break
+        # Sync oracle fee history to monitor card for dashboard display
+        oracle_fees = oracle.get_fee_history(sell_symbol, buy_symbol, limit=20)
+        if oracle_fees:
+            for fee_val in oracle_fees:
+                await self.monitor.update_fee_quote_history(monitor_card, fee_val)
 
         while True:
             self._raise_if_stop_requested()
@@ -3013,53 +3031,55 @@ class AutoswapBot:
                         bypassed_free_fee_status = daily_free_fee_status
 
             if violating_hop is None:
-                # Fee quote saat ini ≤ cap, tapi cek juga rata-rata N quote terakhir
-                if len(fee_history) >= stability_samples:
-                    recent_fees = fee_history[-stability_samples:]
-                    avg_fee = sum(recent_fees) / len(recent_fees)
-                    if avg_fee > fee_cap:
-                        # Rata-rata masih di atas cap, terus polling
+                # Fee quote saat ini ≤ cap — check oracle avg for stability
+                oracle_sample_count = oracle.sample_count(sell_symbol, buy_symbol)
+                oracle_avg = oracle.get_avg_fee(sell_symbol, buy_symbol, stability_samples)
+
+                if oracle_sample_count >= stability_samples and oracle_avg is not None:
+                    if oracle_avg > fee_cap:
+                        # Oracle avg still above cap, keep waiting
+                        recent_fees = oracle.get_fee_history(sell_symbol, buy_symbol, limit=stability_samples)
                         recent_text = ", ".join(f"{f}" for f in recent_fees)
                         logger.warning(
-                            "Round %s fee quote OK tapi rata-rata %s quote terakhir [%s] = %s CC > batas %s CC, terus tunggu",
+                            "Round %s fee quote OK tapi oracle avg(%s) = %s CC > batas %s CC [%s], terus tunggu",
                             round_number,
                             stability_samples,
-                            recent_text,
-                            avg_fee,
+                            oracle_avg,
                             fee_cap,
+                            recent_text,
                         )
                         await self.monitor.log_event(
                             monitor_card,
                             (
-                                f"📊 Fee saat ini OK tapi avg({stability_samples}) = {avg_fee} CC "
+                                f"📊 Fee saat ini OK tapi oracle avg({stability_samples}) = {oracle_avg} CC "
                                 f"> batas {fee_cap} CC [{recent_text}], tunggu stabil"
                             ),
                         )
-                        # Jatuh ke bawah untuk polling lagi (treat as violating)
                         violating_hop = self._highest_cc_fee_hop(route)
                         if violating_hop is None:
                             return route, None, None
                     else:
-                        # Rata-rata OK → lolos
+                        # Oracle avg OK → stable
+                        recent_fees = oracle.get_fee_history(sell_symbol, buy_symbol, limit=stability_samples)
                         recent_text = ", ".join(f"{f}" for f in recent_fees)
                         logger.info(
-                            "Round %s fee stabil: avg(%s) = %s CC ≤ batas %s CC [%s]",
+                            "Round %s fee stabil (oracle): avg(%s) = %s CC ≤ batas %s CC [%s]",
                             round_number,
                             stability_samples,
-                            avg_fee,
+                            oracle_avg,
                             fee_cap,
                             recent_text,
                         )
                         await self.monitor.log_event(
                             monitor_card,
-                            f"✅ Fee stabil: avg({stability_samples}) = {avg_fee} CC ≤ {fee_cap} CC",
+                            f"✅ Fee stabil (oracle): avg({stability_samples}) = {oracle_avg} CC ≤ {fee_cap} CC",
                         )
                         return route, None, None
                 else:
-                    # Belum cukup samples, WAJIB tunggu sampai punya N samples penuh
-                    collected = len(fee_history)
+                    # Not enough oracle samples yet, wait for more
+                    collected = oracle_sample_count
                     logger.info(
-                        "Round %s fee quote OK tapi baru %s/%s samples terkumpul, tunggu data fee lengkap",
+                        "Round %s fee quote OK tapi oracle baru %s/%s samples, tunggu data fee lengkap",
                         round_number,
                         collected,
                         stability_samples,
@@ -3067,14 +3087,12 @@ class AutoswapBot:
                     await self.monitor.log_event(
                         monitor_card,
                         (
-                            f"📊 Fee OK tapi baru {collected}/{stability_samples} samples, "
+                            f"📊 Fee OK tapi oracle baru {collected}/{stability_samples} samples, "
                             f"tunggu data fee lengkap sebelum eksekusi"
                         ),
                     )
-                    # Jatuh ke bawah untuk polling lagi
                     violating_hop = self._highest_cc_fee_hop(route)
                     if violating_hop is None:
-                        # Tidak ada CC fee hop, tidak bisa polling → lolos
                         return route, None, None
 
             if bypassed_free_fee_status is not None:
@@ -3102,33 +3120,7 @@ class AutoswapBot:
 
             violating_hop_index, violating_hop_data = violating_hop
             current_fee = violating_hop_data.network_fee_amount
-            account_name = None
-            if False:
-                daily_free_fee_status = await self._sync_daily_free_fee_state_from_history(
-                    sdk=sdk,
-                    account_name=account_name,
-                    logger=logger,
-                    monitor_card=monitor_card,
-                )
-                if daily_free_fee_status.window_open and daily_free_fee_status.remaining > 0:
-                    bypass_candidate = self._first_network_fee_cap_violation(
-                        route,
-                        fee_cap=fee_cap,
-                        allow_first_hop_free=True,
-                    )
-                    logger.info(
-                        "Round %s memakai free fee swap harian %s/3 | fee=%s CC | batas=%s CC",
-                        round_number,
-                        free_swap_number,
-                        current_fee,
-                        fee_cap,
-                    )
-                    await self.monitor.log_event(
-                        monitor_card,
-                        f"🎁 Free fee swap {free_swap_number}/3 active, fee cap bypassed ({current_fee} CC)",
-                        force=True,
-                    )
-                    return route, None, daily_free_fee_status
+
             now_utc = datetime.now(timezone.utc)
             if fee_retry_deadline_utc is not None and now_utc >= fee_retry_deadline_utc:
                 return (
@@ -3143,7 +3135,8 @@ class AutoswapBot:
                     None,
                 )
 
-            wait_seconds = self._sample_network_fee_poll_seconds()
+            # Calculate timeout for oracle wait
+            oracle_wait_timeout: float | None = None
             if fee_retry_deadline_utc is not None:
                 seconds_left = (fee_retry_deadline_utc - now_utc).total_seconds()
                 if seconds_left <= 0:
@@ -3158,10 +3151,10 @@ class AutoswapBot:
                         ),
                         None,
                     )
-                wait_seconds = min(wait_seconds, max(1.0, seconds_left))
+                oracle_wait_timeout = max(1.0, seconds_left)
 
             logger.warning(
-                "Round %s menunggu network fee turun | hop=%s/%s | %s -> %s | fee=%s CC | batas=%s CC",
+                "Round %s menunggu oracle fee turun | hop=%s/%s | %s -> %s | fee=%s CC | batas=%s CC",
                 round_number,
                 violating_hop_index,
                 len(route.hops),
@@ -3173,19 +3166,54 @@ class AutoswapBot:
             await self.monitor.log_event(
                 monitor_card,
                 (
-                    f"⏳ Network fee hop {violating_hop_index}/{len(route.hops)} "
-                    f"{violating_hop_data.sell_symbol}->{violating_hop_data.buy_symbol} "
-                    f"{current_fee} CC > limit {fee_cap} CC, waiting {int(wait_seconds)}s"
+                    f"⏳ Waiting oracle: fee {violating_hop_data.sell_symbol}->"
+                    f"{violating_hop_data.buy_symbol} "
+                    f"{current_fee} CC > limit {fee_cap} CC"
                 ),
             )
             await self.monitor.update_status(
                 monitor_card,
                 round_number=round_number,
                 phase="WAITING_FEE",
-                next_wait_seconds=wait_seconds,
+                next_wait_seconds=oracle_wait_timeout,
                 route_plan=route,
             )
-            await self._sleep_or_stop(wait_seconds)
+
+            # --- Use shared oracle instead of per-account polling ---
+            fee_ok = await oracle.wait_for_stable_fee(
+                sell_symbol,
+                buy_symbol,
+                fee_cap=fee_cap,
+                stability_samples=stability_samples,
+                stop_event=self._stop_requested,
+                timeout=oracle_wait_timeout,
+            )
+
+            self._raise_if_stop_requested()
+
+            # Sync oracle history to monitor card
+            latest_oracle_fees = oracle.get_fee_history(sell_symbol, buy_symbol, limit=stability_samples)
+            for fee_val in latest_oracle_fees:
+                await self.monitor.update_fee_quote_history(monitor_card, fee_val)
+
+            if not fee_ok:
+                # Timed out or stopped — check deadline
+                if fee_retry_deadline_utc is not None:
+                    now_utc = datetime.now(timezone.utc)
+                    if now_utc >= fee_retry_deadline_utc:
+                        return (
+                            route,
+                            PlanIssue(
+                                round_number=round_number,
+                                sell_symbol=sell_symbol,
+                                requested_amount=actual_amount,
+                                available_amount=balances.get(sell_symbol, Decimal("0")),
+                                reason="network fee tetap di atas batas sampai 30 detik sebelum jadwal berikutnya",
+                            ),
+                            None,
+                        )
+
+            # Re-quote per-account route with actual amounts after oracle says fee is OK
             info = await sdk.get_account_info()
             balances = self._balances_by_symbol(info)
             try:
@@ -3217,13 +3245,6 @@ class AutoswapBot:
                 continue
             if issue is not None:
                 return route, issue, None
-
-            # --- FIX: Catat fee dari quote polling ke history untuk deteksi stabilitas ---
-            for hop in route.hops:
-                if hop.network_fee_symbol == CC_SYMBOL:
-                    fee_history.append(hop.network_fee_amount)
-                    await self.monitor.update_fee_quote_history(monitor_card, hop.network_fee_amount)
-                    break
         return route, None, None
 
     def _first_network_fee_cap_violation(
