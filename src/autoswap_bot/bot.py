@@ -3031,7 +3031,12 @@ class AutoswapBot:
                         bypassed_free_fee_status = daily_free_fee_status
 
             if violating_hop is None:
-                # Fee quote saat ini ≤ cap — check oracle avg for stability
+                # Fee quote saat ini ≤ cap
+                if not self.config.runtime.fee_stability_enabled:
+                    # Stability check disabled — langsung lolos jika fee ≤ cap
+                    return route, None, None
+
+                # Check oracle avg for stability
                 oracle_sample_count = oracle.sample_count(sell_symbol, buy_symbol)
                 oracle_avg = oracle.get_avg_fee(sell_symbol, buy_symbol, stability_samples)
 

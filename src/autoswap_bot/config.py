@@ -185,6 +185,7 @@ class RuntimeConfig:
     max_concurrency: int
     swap_delay_seconds_range: FloatRange
     max_network_fee_cc_per_execution: Decimal | None
+    fee_stability_enabled: bool
     fee_stability_samples: int
     network_fee_poll_seconds_range: FloatRange
     full_24h_mode: bool
@@ -294,6 +295,7 @@ def load_config(path: str | Path) -> BotConfig:
             if settings.get("max_network_fee_cc_per_execution") not in {None, ""}
             else None
         ),
+        fee_stability_enabled=bool(settings.get("fee_stability_enabled", True)),
         fee_stability_samples=int(settings.get("fee_stability_samples", 3)),
         network_fee_poll_seconds_range=_parse_float_range(
             settings.get("network_fee_poll_seconds", 30.0),
