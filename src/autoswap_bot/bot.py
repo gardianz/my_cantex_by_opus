@@ -4587,6 +4587,16 @@ class AutoswapBot:
                 ):
                     return synced_completed_rounds
 
+            # Jika sync gagal (None) dan tidak butuh increment, return fallback
+            # Ini mencegah infinite polling untuk akun baru tanpa trading history
+            if synced_completed_rounds is None and not require_increment:
+                fallback = max(min(previous_completed_rounds, prepared_run.rounds), 0)
+                logger.info(
+                    "Trading history sync gagal/kosong, lanjut dengan progress=%s (tidak menunggu)",
+                    fallback,
+                )
+                return fallback
+
             wait_seconds = self._sample_network_fee_poll_seconds()
             displayed_rounds = synced_completed_rounds
             if displayed_rounds is None:
