@@ -110,10 +110,44 @@ class AutoswapBot:
 
     def _on_oracle_poll(self) -> None:
         """Called by fee oracle after each poll cycle to refresh dashboard + add log."""
-        log_line = self.monitor._oracle_log_line()
-        if log_line is not None:
-            self.monitor._terminal_logs.append(log_line)
+        # Check if all accounts have completed their targets → pause oracle
+        if not self.fee_oracle.is_paused:
+            all_done = self._all_accounts_completed()
+            if all_done:
+                self.fee_oracle.pause()
+                self.monitor._terminal_logs.append(
+                    f"[{self._now_local_str()}] [oracle] Paused — all accounts reached target"
+                )
+        elif self.fee_oracle.is_paused:
+            # Check if any account needs oracle again (e.g. after daily reset)
+            if not self._all_accounts_completed():
+                self.fee_oracle.resume()
+
+        if not self.fee_oracle.is_paused:
+            log_line = self.monitor._oracle_log_line()
+            if log_line is not None:
+                self.monitor._terminal_logs.append(log_line)
         self.monitor._render_terminal_dashboard(force=True)
+
+    def _all_accounts_completed(self) -> bool:
+        """Check if all account cards have reached their swap targets."""
+        cards = list(self.monitor._cards.values())
+        if not cards:
+            return False
+        return all(
+            card.phase in {
+                "FINISHED", "WAITING_NEXT_DAY", "STOPPED_MANUAL",
+                "WEEKLY-STOP", "WEEKLY-REFILL",
+            }
+            or card.phase.startswith("STOPPED")
+            or card.phase.startswith("FAILED")
+            for card in cards
+        )
+
+    @staticmethod
+    def _now_local_str() -> str:
+        from datetime import datetime
+        return datetime.now().astimezone().strftime("%H:%M:%S")
 
     async def request_stop(self) -> None:
         self._stop_requested.set()

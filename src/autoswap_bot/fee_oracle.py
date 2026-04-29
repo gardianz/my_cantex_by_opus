@@ -79,6 +79,9 @@ class SharedFeeOracle:
         # Track whether SDK is ready
         self._sdk_ready = asyncio.Event()
 
+        # Pause flag — when True, polling is skipped
+        self._paused: bool = False
+
         # Optional callback called after each poll cycle (for dashboard refresh)
         self._on_poll_callback: Any | None = None
 
@@ -152,6 +155,22 @@ class SharedFeeOracle:
     @property
     def is_running(self) -> bool:
         return self._task is not None and not self._task.done()
+
+    @property
+    def is_paused(self) -> bool:
+        return self._paused
+
+    def pause(self) -> None:
+        """Pause polling (e.g. when all accounts have completed their targets)."""
+        if not self._paused:
+            self._paused = True
+            logger.info("Fee oracle paused (all targets reached)")
+
+    def resume(self) -> None:
+        """Resume polling."""
+        if self._paused:
+            self._paused = False
+            logger.info("Fee oracle resumed")
 
     # ------------------------------------------------------------------
     # Data access (read-only, safe from any coroutine)
@@ -297,6 +316,14 @@ class SharedFeeOracle:
         logger.info("Fee oracle SDK ready — starting poll cycles")
 
         while not self._stop_event.is_set():
+            # Skip polling if paused (all accounts completed targets)
+            if self._paused:
+                try:
+                    await asyncio.wait_for(self._stop_event.wait(), timeout=30.0)
+                    return
+                except asyncio.TimeoutError:
+                    continue
+
             try:
                 await self._poll_all_pairs()
             except asyncio.CancelledError:
