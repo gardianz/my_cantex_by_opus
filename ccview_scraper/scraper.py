@@ -207,23 +207,54 @@ async def fetch_party_info(
 def parse_balance(party_info: dict | None) -> tuple[Decimal, Decimal, Decimal]:
     """Parse balance from party info response.
 
+    API response structure:
+    {
+        "balance": {
+            "total_coin_holdings": "57.387...",
+            "total_unlocked_coin": "57.387...",
+            "total_locked_coin": "0.000..."
+        }
+    }
+
     Returns: (total_balance, unlocked, locked)
     """
     if party_info is None:
         return Decimal("0"), Decimal("0"), Decimal("0")
 
-    # Try different response structures
-    balance_data = party_info.get("balance", party_info)
-    if isinstance(balance_data, dict):
-        total = Decimal(str(balance_data.get("total", balance_data.get("unlocked_amount", "0"))))
-        unlocked = Decimal(str(balance_data.get("unlocked", balance_data.get("unlocked_amount", "0"))))
-        locked = Decimal(str(balance_data.get("locked", balance_data.get("locked_amount", "0"))))
-        return total, unlocked, locked
+    try:
+        balance_data = party_info.get("balance", {})
+        if isinstance(balance_data, dict):
+            total = Decimal(str(
+                balance_data.get("total_coin_holdings")
+                or balance_data.get("total_available_coin")
+                or balance_data.get("total")
+                or "0"
+            ))
+            unlocked = Decimal(str(
+                balance_data.get("total_unlocked_coin")
+                or balance_data.get("unlocked")
+                or "0"
+            ))
+            locked = Decimal(str(
+                balance_data.get("total_locked_coin")
+                or balance_data.get("locked")
+                or "0"
+            ))
+            if total > 0 or unlocked > 0:
+                return total, unlocked, locked
 
-    # Fallback: try top-level fields
-    unlocked = Decimal(str(party_info.get("unlocked_amount", party_info.get("balance", "0"))))
-    locked = Decimal(str(party_info.get("locked_amount", "0")))
-    return unlocked + locked, unlocked, locked
+        # Fallback: try amulets field
+        amulets = party_info.get("amulets", {})
+        if isinstance(amulets, dict):
+            amulet_balance = Decimal(str(amulets.get("amulet_balance", "0")))
+            locked_amulet = Decimal(str(amulets.get("locked_amulet_balance", "0")))
+            if amulet_balance > 0:
+                return amulet_balance + locked_amulet, amulet_balance, locked_amulet
+
+    except Exception:
+        pass
+
+    return Decimal("0"), Decimal("0"), Decimal("0")
 
 
 def parse_counterparties(data: dict) -> list[CounterpartyData]:
