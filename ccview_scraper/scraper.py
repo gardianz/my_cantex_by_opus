@@ -1,25 +1,29 @@
 """CCView.io Fee Scraper — menggunakan API internal ccview.io.
 
-Mengambil data fee harian dari counterparties API dan mengirim laporan ke Telegram.
+Mengambil data fee harian, balance, reward, dan estimasi dari counterparties API.
 
-API Endpoint:
+API Endpoints:
     GET https://ccview.io/api/v1/internal/api/v1/parties/counterparties
-        ?party_id={party_id}&limit=10&offset=0&start={YYYY-MM-DD}&end={YYYY-MM-DD}
+        ?party_id={party_id}&limit=50&offset=0&start={YYYY-MM-DD}&end={YYYY-MM-DD}
+    GET https://ccview.io/api/v1/internal/api/v1/parties/{party_id}
+        (untuk balance)
 
 Usage:
     python scraper.py                    # Scrape hari ini
     python scraper.py 2026-04-29         # Scrape tanggal tertentu
     python scraper.py 2026-04-28 2026-04-29  # Scrape range tanggal
+    python scraper.py daemon             # Mode daemon (24 jam)
 """
 
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import sys
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
 
 import httpx
@@ -33,10 +37,16 @@ load_dotenv(SCRIPT_DIR / ".env")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN_SCRAPER", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID_SCRAPER", "")
 PARTYID_FILE = SCRIPT_DIR / "partyid.txt"
-BASE_URL = "https://ccview.io/api/v1/internal/api/v1/parties/counterparties"
+COUNTERPARTIES_URL = "https://ccview.io/api/v1/internal/api/v1/parties/counterparties"
+PARTY_INFO_URL = "https://ccview.io/api/v1/internal/api/v1/parties"
 MAX_RETRIES = 3
 REQUEST_DELAY_SECONDS = float(os.getenv("REQUEST_DELAY_SECONDS", "1.5"))
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "30"))
+
+# Reward constants
+REWARD_FULL = Decimal("14.345")  # Reward jika swap volume >= 50 tx
+REWARD_PER_SWAP = Decimal("0.28")  # Reward per swap jika < 50 tx
+REWARD_THRESHOLD_TX = 50  # Minimum tx untuk reward penuh
 
 # Validator identifier patterns
 VALIDATOR_PATTERNS = ("cantex-validator", "Cantex-validator")
@@ -61,12 +71,23 @@ class FeeReport:
     party_short: str
     date_start: str
     date_end: str
+    # Fee data
     validator_fee_total: Decimal
     validator_tx_count: int
     avg_fee_per_swap: Decimal
     swap_volume: Decimal
     swap_tx_count: int
     total_tx: int
+    # Balance
+    balance: Decimal
+    balance_unlocked: Decimal
+    balance_locked: Decimal
+    # Reward
+    reward: Decimal
+    reward_net: Decimal  # reward - validator fee
+    # Estimasi
+    days_remaining: int  # balance / validator fee per hari
+    # Raw
     counterparties: list[CounterpartyData]
     error: str | None = None
 
@@ -99,25 +120,33 @@ def shorten_party_id(party_id: str, max_len: int = 20) -> str:
     return f"{party_id[:max_len]}..."
 
 
-async def init_session(client: httpx.AsyncClient) -> bool:
-    """Initialize session by visiting ccview.io homepage + session endpoint.
+def calculate_reward(swap_tx_count: int) -> Decimal:
+    """Calculate reward based on swap transaction count.
 
-    The API requires a valid session cookie. We get it by:
-    1. GET https://ccview.io/ — sets initial Cloudflare cookies
-    2. GET https://ccview.io/api/v1/session — establishes API session
+    >= 50 tx: full reward (14.345 CC)
+    < 50 tx: swap_count * 0.28 CC
     """
-    try:
-        # Step 1: Visit homepage to get initial cookies (Cloudflare cf_clearance etc.)
-        print("  Initializing session (visiting homepage)...")
-        resp = await client.get("https://ccview.io/", timeout=REQUEST_TIMEOUT)
-        print(f"  Homepage: HTTP {resp.status_code}, cookies: {len(client.cookies)}")
+    if swap_tx_count >= REWARD_THRESHOLD_TX:
+        return REWARD_FULL
+    return REWARD_PER_SWAP * swap_tx_count
 
-        # Step 2: Hit session endpoint to establish API session
-        print("  Establishing API session...")
-        resp = await client.get(
-            "https://ccview.io/api/v1/session",
-            timeout=REQUEST_TIMEOUT,
-        )
+
+def calculate_days_remaining(balance: Decimal, daily_fee: Decimal) -> int:
+    """Calculate how many days the account can sustain with current balance.
+
+    days = floor(balance / daily_fee)
+    """
+    if daily_fee <= 0:
+        return 999  # No fee = infinite
+    return int(balance / daily_fee)
+
+
+async def init_session(client: httpx.AsyncClient) -> bool:
+    """Initialize session by visiting ccview.io homepage + session endpoint."""
+    try:
+        print("  Initializing session...")
+        resp = await client.get("https://ccview.io/", timeout=REQUEST_TIMEOUT)
+        resp = await client.get("https://ccview.io/api/v1/session", timeout=REQUEST_TIMEOUT)
         print(f"  Session: HTTP {resp.status_code}, cookies: {len(client.cookies)}")
         return resp.status_code == 200
     except Exception as exc:
@@ -139,22 +168,62 @@ async def fetch_counterparties(
         "start": start_date,
         "end": end_date,
     }
-
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            response = await client.get(BASE_URL, params=params, timeout=REQUEST_TIMEOUT)
+            response = await client.get(COUNTERPARTIES_URL, params=params, timeout=REQUEST_TIMEOUT)
             if response.status_code == 200:
                 return response.json()
             if response.status_code == 404:
                 return None
-            print(f"  [attempt {attempt}/{MAX_RETRIES}] HTTP {response.status_code}: {response.text[:200]}")
+            print(f"  [attempt {attempt}/{MAX_RETRIES}] counterparties HTTP {response.status_code}: {response.text[:200]}")
         except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError) as exc:
-            print(f"  [attempt {attempt}/{MAX_RETRIES}] Error: {exc}")
-
+            print(f"  [attempt {attempt}/{MAX_RETRIES}] counterparties error: {exc}")
         if attempt < MAX_RETRIES:
             await asyncio.sleep(2 ** attempt)
-
     return None
+
+
+async def fetch_party_info(
+    client: httpx.AsyncClient,
+    party_id: str,
+) -> dict | None:
+    """Fetch party info (balance) from ccview.io API."""
+    url = f"{PARTY_INFO_URL}/{party_id}"
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            response = await client.get(url, timeout=REQUEST_TIMEOUT)
+            if response.status_code == 200:
+                return response.json()
+            if response.status_code == 404:
+                return None
+            print(f"  [attempt {attempt}/{MAX_RETRIES}] party info HTTP {response.status_code}: {response.text[:200]}")
+        except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError) as exc:
+            print(f"  [attempt {attempt}/{MAX_RETRIES}] party info error: {exc}")
+        if attempt < MAX_RETRIES:
+            await asyncio.sleep(2 ** attempt)
+    return None
+
+
+def parse_balance(party_info: dict | None) -> tuple[Decimal, Decimal, Decimal]:
+    """Parse balance from party info response.
+
+    Returns: (total_balance, unlocked, locked)
+    """
+    if party_info is None:
+        return Decimal("0"), Decimal("0"), Decimal("0")
+
+    # Try different response structures
+    balance_data = party_info.get("balance", party_info)
+    if isinstance(balance_data, dict):
+        total = Decimal(str(balance_data.get("total", balance_data.get("unlocked_amount", "0"))))
+        unlocked = Decimal(str(balance_data.get("unlocked", balance_data.get("unlocked_amount", "0"))))
+        locked = Decimal(str(balance_data.get("locked", balance_data.get("locked_amount", "0"))))
+        return total, unlocked, locked
+
+    # Fallback: try top-level fields
+    unlocked = Decimal(str(party_info.get("unlocked_amount", party_info.get("balance", "0"))))
+    locked = Decimal(str(party_info.get("locked_amount", "0")))
+    return unlocked + locked, unlocked, locked
 
 
 def parse_counterparties(data: dict) -> list[CounterpartyData]:
@@ -165,7 +234,6 @@ def parse_counterparties(data: dict) -> list[CounterpartyData]:
     result = []
     for item in items:
         cid = item.get("counterparty_id", "")
-        # Resolve display name from ANS binding
         display_name = cid
         if cid in ans_binding:
             bindings = ans_binding[cid]
@@ -191,11 +259,14 @@ def build_fee_report(
     start_date: str,
     end_date: str,
     counterparties: list[CounterpartyData],
+    balance: Decimal,
+    balance_unlocked: Decimal,
+    balance_locked: Decimal,
 ) -> FeeReport:
-    """Build fee report from counterparties data."""
+    """Build fee report from counterparties data + balance."""
     party_short = shorten_party_id(party_id)
 
-    # Find validator (fee) counterparty
+    # Find validator (fee) and pool-custodian
     validator = None
     pool_custodian = None
     for cp in counterparties:
@@ -222,8 +293,14 @@ def build_fee_report(
         if validator_tx_count > 0
         else Decimal("0")
     )
-
     total_tx = sum(cp.total_transfers_count for cp in counterparties)
+
+    # Reward calculation
+    reward = calculate_reward(swap_tx_count)
+    reward_net = reward - validator_fee_total
+
+    # Estimasi hari bertahan
+    days_remaining = calculate_days_remaining(balance, validator_fee_total)
 
     return FeeReport(
         party_id=party_id,
@@ -236,6 +313,12 @@ def build_fee_report(
         swap_volume=swap_volume,
         swap_tx_count=swap_tx_count,
         total_tx=total_tx,
+        balance=balance,
+        balance_unlocked=balance_unlocked,
+        balance_locked=balance_locked,
+        reward=reward,
+        reward_net=reward_net,
+        days_remaining=days_remaining,
         counterparties=counterparties,
     )
 
@@ -262,26 +345,30 @@ def format_report_telegram(report: FeeReport) -> str:
         else f"{report.date_start} → {report.date_end}"
     )
 
+    # Reward status
+    reward_status = "✅" if report.reward_net > 0 else "⚠️"
+    days_emoji = "🟢" if report.days_remaining >= 7 else ("🟡" if report.days_remaining >= 3 else "🔴")
+
     lines = [
-        f"📊 <b>CCView Fee Report — {date_display}</b>",
+        f"📊 <b>CCView Report — {date_display}</b>",
         "",
         f"🔑 <code>{report.party_short}</code>",
-        f"├─ Validator Fee: <b>{format_decimal(report.validator_fee_total)} CC</b> ({report.validator_tx_count} tx)",
-        f"├─ Avg Fee/Swap: <b>{format_decimal(report.avg_fee_per_swap)} CC</b>",
-        f"├─ Swap Volume: {format_decimal(report.swap_volume, 2)} CC ({report.swap_tx_count} tx)",
-        f"└─ Total Tx: {report.total_tx}",
+        "",
+        f"💰 <b>Balance:</b> {format_decimal(report.balance, 2)} CC",
+        "",
+        f"📋 <b>Fee:</b>",
+        f"├─ Validator Fee: {format_decimal(report.validator_fee_total)} CC ({report.validator_tx_count} tx)",
+        f"├─ Avg Fee/Swap: {format_decimal(report.avg_fee_per_swap)} CC",
+        f"└─ Swap Volume: {format_decimal(report.swap_volume, 2)} CC ({report.swap_tx_count} tx)",
+        "",
+        f"🎁 <b>Reward:</b>",
+        f"├─ Reward: {format_decimal(report.reward)} CC",
+        f"├─ Fee: -{format_decimal(report.validator_fee_total)} CC",
+        f"└─ {reward_status} Bersih: <b>{format_decimal(report.reward_net)} CC</b>",
+        "",
+        f"{days_emoji} <b>Estimasi:</b> ~{report.days_remaining} hari tersisa",
+        f"   ({format_decimal(report.balance, 2)} / {format_decimal(report.validator_fee_total)} = {report.days_remaining} hari)",
     ]
-
-    # Add all counterparties detail
-    if report.counterparties:
-        lines.append("")
-        lines.append("📋 <b>Counterparties:</b>")
-        for cp in report.counterparties:
-            name = cp.display_name if len(cp.display_name) <= 30 else f"{cp.display_name[:27]}..."
-            lines.append(
-                f"  • {name}: {cp.total_transfers_count} tx, "
-                f"{format_decimal(cp.total_transfers_volume, 2)} CC"
-            )
 
     return "\n".join(lines)
 
@@ -291,12 +378,16 @@ def format_report_console(report: FeeReport) -> str:
     if report.error:
         return f"  ERROR: {report.party_short} — {report.error}"
 
+    reward_sign = "+" if report.reward_net >= 0 else ""
     return (
         f"  {report.party_short}\n"
+        f"    Balance: {format_decimal(report.balance, 2)} CC\n"
         f"    Fee: {format_decimal(report.validator_fee_total)} CC ({report.validator_tx_count} tx) | "
         f"Avg: {format_decimal(report.avg_fee_per_swap)} CC/swap\n"
-        f"    Volume: {format_decimal(report.swap_volume, 2)} CC ({report.swap_tx_count} tx) | "
-        f"Total: {report.total_tx} tx"
+        f"    Swap: {report.swap_tx_count} tx | Volume: {format_decimal(report.swap_volume, 2)} CC\n"
+        f"    Reward: {format_decimal(report.reward)} CC | "
+        f"Bersih: {reward_sign}{format_decimal(report.reward_net)} CC\n"
+        f"    Estimasi: ~{report.days_remaining} hari tersisa"
     )
 
 
@@ -361,8 +452,13 @@ async def run_scrape(
         for i, party_id in enumerate(party_ids, 1):
             print(f"[{i}/{len(party_ids)}] {shorten_party_id(party_id)}...")
 
-            data = await fetch_counterparties(client, party_id, start_date, end_date)
-            if data is None:
+            # Fetch counterparties + balance in parallel
+            cp_data, party_info = await asyncio.gather(
+                fetch_counterparties(client, party_id, start_date, end_date),
+                fetch_party_info(client, party_id),
+            )
+
+            if cp_data is None:
                 report = FeeReport(
                     party_id=party_id,
                     party_short=shorten_party_id(party_id),
@@ -374,12 +470,22 @@ async def run_scrape(
                     swap_volume=Decimal("0"),
                     swap_tx_count=0,
                     total_tx=0,
+                    balance=Decimal("0"),
+                    balance_unlocked=Decimal("0"),
+                    balance_locked=Decimal("0"),
+                    reward=Decimal("0"),
+                    reward_net=Decimal("0"),
+                    days_remaining=0,
                     counterparties=[],
                     error="Failed to fetch data from ccview.io API",
                 )
             else:
-                counterparties = parse_counterparties(data)
-                report = build_fee_report(party_id, start_date, end_date, counterparties)
+                counterparties = parse_counterparties(cp_data)
+                balance, balance_unlocked, balance_locked = parse_balance(party_info)
+                report = build_fee_report(
+                    party_id, start_date, end_date, counterparties,
+                    balance, balance_unlocked, balance_locked,
+                )
 
             reports.append(report)
             print(format_report_console(report))
@@ -400,24 +506,40 @@ async def run_scrape(
     print(f"{'=' * 50}")
     print("SUMMARY")
     print(f"{'=' * 50}")
-    total_fee = sum(r.validator_fee_total for r in reports if not r.error)
-    total_swaps = sum(r.validator_tx_count for r in reports if not r.error)
-    total_volume = sum(r.swap_volume for r in reports if not r.error)
+    ok_reports = [r for r in reports if not r.error]
+    total_fee = sum(r.validator_fee_total for r in ok_reports)
+    total_swaps = sum(r.validator_tx_count for r in ok_reports)
+    total_volume = sum(r.swap_volume for r in ok_reports)
+    total_reward = sum(r.reward for r in ok_reports)
+    total_reward_net = sum(r.reward_net for r in ok_reports)
+    total_balance = sum(r.balance for r in ok_reports)
     avg_fee_all = total_fee / total_swaps if total_swaps > 0 else Decimal("0")
-    print(f"  Accounts: {len(reports)} ({sum(1 for r in reports if not r.error)} OK, {sum(1 for r in reports if r.error)} errors)")
+    avg_days = calculate_days_remaining(total_balance, total_fee) if total_fee > 0 else 999
+
+    print(f"  Accounts: {len(reports)} ({len(ok_reports)} OK, {sum(1 for r in reports if r.error)} errors)")
+    print(f"  Total Balance: {format_decimal(total_balance, 2)} CC")
     print(f"  Total Fee: {format_decimal(total_fee)} CC ({total_swaps} swaps)")
     print(f"  Avg Fee/Swap: {format_decimal(avg_fee_all)} CC")
     print(f"  Total Volume: {format_decimal(total_volume, 2)} CC")
+    print(f"  Total Reward: {format_decimal(total_reward)} CC")
+    print(f"  Total Reward Bersih: {format_decimal(total_reward_net)} CC")
+    print(f"  Avg Days Remaining: ~{avg_days} hari")
 
     if send_to_telegram and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
         date_display = start_date if start_date == end_date else f"{start_date} → {end_date}"
+        reward_sign = "+" if total_reward_net >= 0 else ""
         summary_text = (
             f"📈 <b>Fee Summary — {date_display}</b>\n"
             f"\n"
-            f"👥 Accounts: {len(reports)} ({sum(1 for r in reports if not r.error)} OK)\n"
-            f"💰 Total Fee: <b>{format_decimal(total_fee)} CC</b> ({total_swaps} swaps)\n"
-            f"📊 Avg Fee/Swap: <b>{format_decimal(avg_fee_all)} CC</b>\n"
-            f"📦 Total Volume: {format_decimal(total_volume, 2)} CC"
+            f"👥 Accounts: {len(ok_reports)}/{len(reports)}\n"
+            f"💰 Total Balance: <b>{format_decimal(total_balance, 2)} CC</b>\n"
+            f"🔥 Total Fee: {format_decimal(total_fee)} CC ({total_swaps} swaps)\n"
+            f"📊 Avg Fee/Swap: {format_decimal(avg_fee_all)} CC\n"
+            f"📦 Total Volume: {format_decimal(total_volume, 2)} CC\n"
+            f"\n"
+            f"🎁 Total Reward: {format_decimal(total_reward)} CC\n"
+            f"💵 Reward Bersih: <b>{reward_sign}{format_decimal(total_reward_net)} CC</b>\n"
+            f"⏳ Avg Estimasi: ~{avg_days} hari tersisa"
         )
         await send_telegram(summary_text)
         print("  → Summary sent to Telegram ✓")
@@ -445,20 +567,15 @@ async def run_once():
 
 
 async def run_daemon():
-    """Run as daemon — automatically scrape yesterday's data when a new UTC day starts.
-
-    The bot watches for UTC midnight. When a new day begins, it waits a short
-    delay (to let data settle), then scrapes the previous day's fee data and
-    sends it to Telegram.
-    """
-    # Delay after midnight before scraping (seconds) — gives ccview.io time to finalize data
-    MIDNIGHT_DELAY = float(os.getenv("MIDNIGHT_DELAY_SECONDS", "300"))  # default 5 minutes
+    """Run as daemon — automatically scrape yesterday's data when a new UTC day starts."""
+    MIDNIGHT_DELAY = float(os.getenv("MIDNIGHT_DELAY_SECONDS", "300"))
 
     party_ids = load_party_ids(PARTYID_FILE)
     print(f"CCView Fee Scraper — DAEMON MODE")
     print(f"{'=' * 50}")
     print(f"Loaded {len(party_ids)} party IDs")
     print(f"Midnight delay: {int(MIDNIGHT_DELAY)}s")
+    print(f"Reward: >= {REWARD_THRESHOLD_TX} tx = {REWARD_FULL} CC, < {REWARD_THRESHOLD_TX} tx = count × {REWARD_PER_SWAP} CC")
     print(f"Watching for UTC day changes...")
     print()
 
@@ -470,14 +587,13 @@ async def run_daemon():
         new_utc_date = now_utc.date()
 
         if new_utc_date != current_utc_date:
-            # New day detected!
             yesterday = current_utc_date.isoformat()
             current_utc_date = new_utc_date
 
             if last_scraped_date == yesterday:
                 print(f"[{now_utc.strftime('%H:%M:%S')} UTC] Already scraped {yesterday}, skipping")
             else:
-                print(f"\n[{now_utc.strftime('%H:%M:%S')} UTC] 🌅 New day detected! Waiting {int(MIDNIGHT_DELAY)}s before scraping {yesterday}...")
+                print(f"\n[{now_utc.strftime('%H:%M:%S')} UTC] 🌅 New day! Waiting {int(MIDNIGHT_DELAY)}s before scraping {yesterday}...")
                 await send_telegram(
                     f"🌅 <b>New UTC day</b> — waiting {int(MIDNIGHT_DELAY)}s before scraping {yesterday}"
                 )
@@ -492,7 +608,6 @@ async def run_daemon():
                     print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC] ❌ Scrape failed: {exc}")
                     await send_telegram(f"❌ <b>Scrape failed for {yesterday}</b>\n{exc}")
 
-        # Check every 30 seconds
         await asyncio.sleep(30)
 
 
