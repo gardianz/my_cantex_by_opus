@@ -3192,7 +3192,7 @@ class AutoswapBot:
                     )
                 oracle_wait_timeout = max(1.0, seconds_left)
 
-            logger.warning(
+            logger.info(
                 "Round %s menunggu oracle fee turun | hop=%s/%s | %s -> %s | fee=%s CC | batas=%s CC",
                 round_number,
                 violating_hop_index,
@@ -3201,14 +3201,6 @@ class AutoswapBot:
                 violating_hop_data.buy_symbol,
                 current_fee,
                 fee_cap,
-            )
-            await self.monitor.log_event(
-                monitor_card,
-                (
-                    f"⏳ Waiting oracle: fee {violating_hop_data.sell_symbol}->"
-                    f"{violating_hop_data.buy_symbol} "
-                    f"{current_fee} CC > limit {fee_cap} CC"
-                ),
             )
             await self.monitor.update_status(
                 monitor_card,
@@ -4587,15 +4579,14 @@ class AutoswapBot:
                 ):
                     return synced_completed_rounds
 
-            # Jika sync gagal (None) dan tidak butuh increment, return fallback
+            # Jika sync gagal (None) dan tidak butuh increment, return 0
             # Ini mencegah infinite polling untuk akun baru tanpa trading history
+            # DAN mencegah stuck di NEXT-DAY saat hari berganti (previous_completed_rounds masih dari hari lama)
             if synced_completed_rounds is None and not require_increment:
-                fallback = max(min(previous_completed_rounds, prepared_run.rounds), 0)
                 logger.info(
-                    "Trading history sync gagal/kosong, lanjut dengan progress=%s (tidak menunggu)",
-                    fallback,
+                    "Trading history sync gagal/kosong, lanjut dengan progress=0 (tidak menunggu)",
                 )
-                return fallback
+                return 0
 
             wait_seconds = self._sample_network_fee_poll_seconds()
             displayed_rounds = synced_completed_rounds
