@@ -27,6 +27,7 @@ config/.autoswap_bot_runtime_state.json
 .env
 .env.*
 !.env.example
+ccview_scraper/partyid.txt
 
 # Local key files referenced by config
 .secrets/
