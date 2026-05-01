@@ -85,6 +85,7 @@ class TelegramCardState:
     next_wait_seconds: float | None = None
     session_finished_utc: datetime | None = None
     fee_quote_history: list[Decimal] = field(default_factory=list)
+    total_spread_loss: dict[str, Decimal] = field(default_factory=dict)
     message_id: int | None = None
     last_render_text: str | None = None
     last_publish_monotonic: float = 0.0
@@ -316,6 +317,19 @@ class TelegramMonitor:
         self._persist_card_state(card)
         await self._refresh_outputs(card, force=force)
 
+    async def record_spread_loss(
+        self,
+        card: TelegramCardState | None,
+        *,
+        symbol: str,
+        amount: Decimal,
+    ) -> None:
+        """Accumulate spread loss (expected_output - actual_output) for a hop."""
+        if card is None:
+            return
+        self._rollover_card_if_needed(card)
+        card.total_spread_loss[symbol] = card.total_spread_loss.get(symbol, Decimal("0")) + amount
+
     async def update_free_fee_status(
         self,
         card: TelegramCardState | None,
@@ -487,29 +501,38 @@ class TelegramMonitor:
             ):
                 return
 
-            text = self._trim_message(self._render_combined_card(cards))
+            full_text = self._render_combined_card(cards)
+            chunks = self._split_message(full_text, max_len=3900)
+            # For edit mode, use only the first chunk (Telegram edit only supports single message)
+            text = chunks[0]
             if self._telegram_message_id is not None and text == self._telegram_last_render_text:
                 return
 
             try:
                 if self._telegram_message_id is None:
-                    response = await self._request(
-                        "sendMessage",
-                        {
-                            "chat_id": self.runtime.telegram_chat_id,
-                            "text": text,
-                            "parse_mode": "HTML",
-                            "disable_web_page_preview": True,
-                        },
-                    )
-                    self._telegram_message_id = response.get("result", {}).get("message_id")
+                    # First publish: send all chunks as separate messages
+                    for chunk_idx, chunk in enumerate(chunks):
+                        response = await self._request(
+                            "sendMessage",
+                            {
+                                "chat_id": self.runtime.telegram_chat_id,
+                                "text": chunk,
+                                "parse_mode": "HTML",
+                                "disable_web_page_preview": True,
+                            },
+                        )
+                        if chunk_idx == 0:
+                            self._telegram_message_id = response.get("result", {}).get("message_id")
                 else:
+                    # Subsequent updates: edit the first message only
+                    # If text is still too long after split, trim it
+                    edit_text = self._trim_message(text)
                     await self._request(
                         "editMessageText",
                         {
                             "chat_id": self.runtime.telegram_chat_id,
                             "message_id": self._telegram_message_id,
-                            "text": text,
+                            "text": edit_text,
                             "parse_mode": "HTML",
                             "disable_web_page_preview": True,
                         },
@@ -599,7 +622,7 @@ class TelegramMonitor:
         self._terminal_last_render_monotonic = now
 
     def _dashboard_col_widths(self) -> tuple[int, ...]:
-        return (12, 9, 10, 10, 12, 12, 24, 22, 14, 12, 12, 42)
+        return (12, 9, 10, 10, 12, 12, 24, 22, 14, 12, 12, 57)
 
     def _dashboard_table_lines(self, cards: list[TelegramCardState]) -> tuple[tuple[int, ...], list[str]]:
         col_widths = self._dashboard_col_widths()
@@ -889,11 +912,13 @@ class TelegramMonitor:
         this_week = self._rebate_amount_compact(summary.rebates.get("this_week")) if summary else "-"
         gas_today = self._dashboard_gas(self._current_day_network_fee(card))
         free_fee = f"{card.daily_free_fee_used}/{card.daily_free_fee_limit}" if card.daily_free_fee_limit > 0 else "-"
+        spread = self._format_spread_loss_compact(card.total_spread_loss)
         return self._compose_dashboard_metrics(
             yesterday,
             this_week,
             gas_today,
             free_fee,
+            spread,
         )
 
     def _dashboard_metrics_header(self) -> str:
@@ -902,6 +927,7 @@ class TelegramMonitor:
             "t week",
             "gas fee",
             "free swap",
+            "spread",
             header=True,
         )
 
@@ -911,6 +937,7 @@ class TelegramMonitor:
         this_week: str,
         gas_fee: str,
         free_swap: str,
+        spread_loss: str = "-",
         *,
         header: bool = False,
     ) -> str:
@@ -920,6 +947,7 @@ class TelegramMonitor:
             self._align_terminal(this_week, 8, align=align),
             self._align_terminal(gas_fee, 9, align=align),
             self._align_terminal(free_swap, 9, align=align),
+            self._align_terminal(spread_loss, 12, align=align),
         )
         return " | ".join(parts)
 
@@ -1123,6 +1151,7 @@ class TelegramMonitor:
         progress = self._dashboard_progress(card)
         plan = self._combined_plan(card)
         fee_route = self._dashboard_route_fee(card)
+        spread_loss = self._format_spread_loss_compact(card.total_spread_loss)
         cc_balance = self._fmt_balance(card.balances.get("CC", Decimal("0")), 4)
         usdcx_balance = self._fmt_balance(card.balances.get("USDCx", Decimal("0")), 4)
         cbtc_balance = self._fmt_balance(card.balances.get("CBTC", Decimal("0")), 8)
@@ -1138,6 +1167,7 @@ class TelegramMonitor:
                 " | ".join(
                     [
                         f"Fee route {fee_route}",
+                        f"Spread {spread_loss}",
                         f"24h {activity_24h}",
                         f"Y {yesterday_rebate}",
                         f"W {this_week_rebate}",
@@ -1591,6 +1621,26 @@ class TelegramMonitor:
             return text
         return text[:3600] + "\n<i>Message trimmed</i>"
 
+    def _split_message(self, text: str, max_len: int = 3900) -> list[str]:
+        """Split a long Telegram message into multiple chunks respecting line boundaries."""
+        if len(text) <= max_len:
+            return [text]
+        chunks: list[str] = []
+        lines = text.split("\n")
+        current_chunk: list[str] = []
+        current_len = 0
+        for line in lines:
+            line_len = len(line) + 1  # +1 for newline
+            if current_len + line_len > max_len and current_chunk:
+                chunks.append("\n".join(current_chunk))
+                current_chunk = []
+                current_len = 0
+            current_chunk.append(line)
+            current_len += line_len
+        if current_chunk:
+            chunks.append("\n".join(current_chunk))
+        return chunks if chunks else [text[:max_len]]
+
     def _format_amount_map_display(self, values: dict[str, Decimal]) -> str:
         if not values:
             return "-"
@@ -1600,6 +1650,19 @@ class TelegramMonitor:
             if rendered == "0":
                 continue
             parts.append(f"{rendered} {symbol}")
+        return ", ".join(parts) if parts else "-"
+
+    def _format_spread_loss_compact(self, values: dict[str, Decimal]) -> str:
+        """Format spread loss map for compact display (Telegram / dashboard)."""
+        if not values:
+            return "-"
+        parts: list[str] = []
+        for symbol, amount in sorted(values.items()):
+            if amount == Decimal("0"):
+                continue
+            short = SYMBOL_SHORT.get(symbol, symbol)
+            rendered = format(amount, ".6f").rstrip("0").rstrip(".")
+            parts.append(f"{short} {rendered}")
         return ", ".join(parts) if parts else "-"
 
     def _format_amount_map(self, values: dict[str, Decimal]) -> str:

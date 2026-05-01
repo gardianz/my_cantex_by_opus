@@ -1598,8 +1598,18 @@ class AutoswapBot:
             )
             tx_identifier = tx_result.get("id") or tx_result.get("transactionId") or tx_result.get("contract_id")
             actual_output_amount = self._parse_decimal_like(tx_result.get("output_amount")) or hop.returned_amount
+            # --- Spread loss & slippage calculation ---
+            spread_loss = hop.returned_amount - actual_output_amount
+            slippage_pct = hop.slippage
+            if spread_loss > Decimal("0"):
+                await self.monitor.record_spread_loss(
+                    monitor_card,
+                    symbol=hop.buy_symbol,
+                    amount=spread_loss,
+                )
             logger.info(
-                "Tx hop %s/%s berhasil | %s -> %s | tx=%s | output=%s %s",
+                "Tx hop %s/%s berhasil | %s -> %s | tx=%s | output=%s %s | "
+                "expected=%s | spread_loss=%s | slippage=%s%%",
                 hop_index,
                 len(route.hops),
                 hop.sell_symbol,
@@ -1607,10 +1617,17 @@ class AutoswapBot:
                 tx_identifier or "-",
                 actual_output_amount,
                 hop.buy_symbol,
+                hop.returned_amount,
+                spread_loss,
+                slippage_pct,
             )
             await self.monitor.log_event(
                 monitor_card,
-                f"? Hop {hop_index}/{len(route.hops)} {hop.sell_symbol}->{hop.buy_symbol} tx={tx_identifier or '-'}",
+                (
+                    f"✅ Hop {hop_index}/{len(route.hops)} {hop.sell_symbol}->{hop.buy_symbol} "
+                    f"tx={tx_identifier or '-'} | "
+                    f"slip={slippage_pct}% spread={spread_loss} {hop.buy_symbol}"
+                ),
             )
             await self.monitor.log_event(
                 monitor_card,
@@ -2104,8 +2121,18 @@ class AutoswapBot:
             )
             tx_identifier = tx_result.get("id") or tx_result.get("transactionId") or tx_result.get("contract_id")
             actual_output_amount = self._parse_decimal_like(tx_result.get("output_amount")) or hop.returned_amount
+            # --- Spread loss & slippage calculation ---
+            spread_loss = hop.returned_amount - actual_output_amount
+            slippage_pct = hop.slippage
+            if spread_loss > Decimal("0"):
+                await self.monitor.record_spread_loss(
+                    monitor_card,
+                    symbol=hop.buy_symbol,
+                    amount=spread_loss,
+                )
             logger.info(
-                "Tx hop %s/%s berhasil | %s -> %s | tx=%s | output=%s %s",
+                "Tx hop %s/%s berhasil | %s -> %s | tx=%s | output=%s %s | "
+                "expected=%s | spread_loss=%s | slippage=%s%%",
                 hop_index,
                 len(route.hops),
                 hop.sell_symbol,
@@ -2113,10 +2140,17 @@ class AutoswapBot:
                 tx_identifier or "-",
                 actual_output_amount,
                 hop.buy_symbol,
+                hop.returned_amount,
+                spread_loss,
+                slippage_pct,
             )
             await self.monitor.log_event(
                 monitor_card,
-                f"? Hop {hop_index}/{len(route.hops)} {hop.sell_symbol}->{hop.buy_symbol} tx={tx_identifier or '-'}",
+                (
+                    f"✅ Hop {hop_index}/{len(route.hops)} {hop.sell_symbol}->{hop.buy_symbol} "
+                    f"tx={tx_identifier or '-'} | "
+                    f"slip={slippage_pct}% spread={spread_loss} {hop.buy_symbol}"
+                ),
             )
             await self.monitor.log_event(
                 monitor_card,
