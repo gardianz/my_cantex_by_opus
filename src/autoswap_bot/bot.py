@@ -4542,6 +4542,7 @@ class AutoswapBot:
         previous_completed_rounds: int,
         require_increment: bool = False,
         force_log: bool = False,
+        max_history_polls: int = 3,
     ) -> int:
         target_minimum = max(min(previous_completed_rounds, prepared_run.rounds), 0)
         if require_increment:
@@ -4549,6 +4550,7 @@ class AutoswapBot:
         if previous_completed_rounds >= prepared_run.rounds:
             target_minimum = prepared_run.rounds
 
+        poll_count = 0
         while True:
             if self._weekly_stop_due_utc():
                 logger.info(
@@ -4579,23 +4581,38 @@ class AutoswapBot:
                 ):
                     return synced_completed_rounds
 
-            # Jika sync gagal (None) dan tidak butuh increment, return 0
-            # Ini mencegah infinite polling untuk akun baru tanpa trading history
-            # DAN mencegah stuck di NEXT-DAY saat hari berganti (previous_completed_rounds masih dari hari lama)
+            # Jika sync gagal (None) dan tidak butuh increment, return langsung
             if synced_completed_rounds is None and not require_increment:
                 logger.info(
                     "Trading history sync gagal/kosong, lanjut dengan progress=0 (tidak menunggu)",
                 )
                 return 0
 
+            # Jika sudah melebihi max polls, return best known value
+            poll_count += 1
+            if poll_count >= max_history_polls:
+                best = synced_completed_rounds if synced_completed_rounds is not None else previous_completed_rounds
+                if require_increment:
+                    # Swap sudah berhasil tapi history belum update — increment secara internal
+                    best = min(previous_completed_rounds + 1, prepared_run.rounds)
+                logger.info(
+                    "Trading history polling limit tercapai (%s/%s), lanjut dengan progress=%s",
+                    poll_count,
+                    max_history_polls,
+                    best,
+                )
+                return max(min(best, prepared_run.rounds), 0)
+
             wait_seconds = self._sample_network_fee_poll_seconds()
             displayed_rounds = synced_completed_rounds
             if displayed_rounds is None:
                 displayed_rounds = max(min(previous_completed_rounds, prepared_run.rounds), 0)
             logger.info(
-                "Menunggu trading history harian update | current=%s | target_min=%s | tunggu=%.0fs",
+                "Menunggu trading history harian update | current=%s | target_min=%s | poll=%s/%s | tunggu=%.0fs",
                 displayed_rounds,
                 target_minimum,
+                poll_count,
+                max_history_polls,
                 wait_seconds,
             )
             await self.monitor.update_status(
