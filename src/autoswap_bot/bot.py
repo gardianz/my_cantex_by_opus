@@ -28,10 +28,11 @@ from cantex_sdk import (
 from .config import AccountConfig, BotConfig, PreparedAccountRun
 from .constants import CC_SYMBOL, MIN_TICKET_SIZE_CC, TRACKED_SYMBOLS, dust_for_symbol
 from .models import ActivitySummary, AccountResult, PlanIssue, RouteHop, RoutePlan
-from .fee_oracle import SharedFeeOracle
 from .routing import RouteOptimizer
 from .runtime_state import BotRuntimeStateStore, DailyFreeFeeStatus
 from .sdk_ext import ExtendedCantexSDK
+from .cycle_tracker import CycleTracker, CycleResult
+from .fee_scraper import FeeScraper
 from .telegram_monitor import TelegramCardState, TelegramMonitor
 
 
@@ -100,71 +101,30 @@ class AutoswapBot:
             logging.getLogger("autoswap_bot.state"),
         )
         self._stop_requested = asyncio.Event()
-        self.fee_oracle = SharedFeeOracle(
-            poll_interval_range=self.config.runtime.network_fee_poll_seconds_range,
-            fee_history_max=50,
-            rng=self._rng,
-        )
-        self.monitor.set_fee_oracle(self.fee_oracle)
-        self.fee_oracle.set_on_poll_callback(self._on_oracle_poll)
+        self._cycle_trackers: dict[str, CycleTracker] = {}
+        self.fee_scraper = FeeScraper()
+        self._account_party_ids: dict[str, str] = {}  # account_name -> party_id
 
-    def _on_oracle_poll(self) -> None:
-        """Called by fee oracle after each poll cycle to refresh dashboard + add log."""
-        # Check if all accounts have completed their targets → pause oracle
-        if not self.fee_oracle.is_paused:
-            all_done = self._all_accounts_completed()
-            if all_done:
-                self.fee_oracle.pause()
-                self.monitor._terminal_logs.append(
-                    f"[{self._now_local_str()}] [oracle] Paused — all accounts reached target"
-                )
-        elif self.fee_oracle.is_paused:
-            # Check if any account needs oracle again (e.g. after daily reset)
-            if not self._all_accounts_completed():
-                self.fee_oracle.resume()
-
-        if not self.fee_oracle.is_paused:
-            log_line = self.monitor._oracle_log_line()
-            if log_line is not None:
-                self.monitor._terminal_logs.append(log_line)
-        self.monitor._render_terminal_dashboard(force=True)
-
-    def _all_accounts_completed(self) -> bool:
-        """Check if all account cards have reached their swap targets."""
-        cards = list(self.monitor._cards.values())
-        if not cards:
-            return False
-        return all(
-            card.phase in {
-                "FINISHED", "WAITING_NEXT_DAY", "STOPPED_MANUAL",
-                "WEEKLY-STOP", "WEEKLY-REFILL",
-            }
-            or card.phase.startswith("STOPPED")
-            or card.phase.startswith("FAILED")
-            for card in cards
-        )
-
-    @staticmethod
-    def _now_local_str() -> str:
-        from datetime import datetime
-        return datetime.now().astimezone().strftime("%H:%M:%S")
+    def _get_cycle_tracker(self, account_name: str) -> CycleTracker:
+        """Get or create a CycleTracker for the given account."""
+        if account_name not in self._cycle_trackers:
+            self._cycle_trackers[account_name] = CycleTracker()
+        return self._cycle_trackers[account_name]
 
     async def request_stop(self) -> None:
         self._stop_requested.set()
-        await self.fee_oracle.stop()
 
     def stop_requested(self) -> bool:
         return self._stop_requested.is_set()
 
     async def run(self) -> list[AccountResult]:
         await self.monitor.start()
-        self.fee_oracle.start()
         try:
             return await asyncio.gather(
                 *(self._run_account(account) for account in self.config.accounts)
             )
         finally:
-            await self.fee_oracle.stop()
+            await self.fee_scraper.close()
             await self.monitor.close()
 
     async def _run_account(self, account: AccountConfig) -> AccountResult:
@@ -250,6 +210,9 @@ class AutoswapBot:
                 await sdk.authenticate(force=True)
                 logger.info("Autentikasi sukses | sesi=%s", session_number)
                 info = await sdk.get_account_info()
+                # Store party_id for ccview fee scraper
+                if info.address:
+                    self._account_party_ids[account.name] = info.address
                 await self.monitor.log_event(
                     monitor_card,
                     f"🗓️ Ready for {prepared_run.rounds} swap rounds",
@@ -307,8 +270,6 @@ class AutoswapBot:
 
                 admin = await sdk.get_account_admin()
                 instruments_by_symbol = self._resolve_instruments(admin.instruments, info)
-                # Register SDK with fee oracle (first account to auth wins)
-                self.fee_oracle.register_sdk(sdk, instruments_by_symbol)
                 router = RouteOptimizer(
                     sdk,
                     instruments_by_symbol,
@@ -1645,6 +1606,30 @@ class AutoswapBot:
                     swap_fee=dict(used_swap_fee),
                 ),
             )
+            # --- Round-trip cycle spread loss tracking ---
+            cycle_tracker = self._get_cycle_tracker(account.name)
+            cycle_result = cycle_tracker.record_swap(
+                sell_symbol=hop.sell_symbol,
+                buy_symbol=hop.buy_symbol,
+                sell_amount=hop.sell_amount,
+                buy_amount=actual_output_amount,
+                network_fee=actual_network_fee,
+                swap_fee=actual_swap_fee,
+            )
+            if cycle_result is not None:
+                await self.monitor.record_cycle_spread_loss(
+                    monitor_card,
+                    cycle_result=cycle_result,
+                )
+                await self.monitor.log_event(
+                    monitor_card,
+                    (
+                        f"🔁 Cycle #{cycle_tracker.cycle_count} complete "
+                        f"({cycle_result.cycle_type}) | "
+                        f"{cycle_result.origin_symbol}: {cycle_result.start_amount} → {cycle_result.end_amount} | "
+                        f"loss={cycle_result.spread_loss}"
+                    ),
+                )
             await self._sleep_between_swaps()
         latest_info = await sdk.get_account_info()
         latest_balances = self._balances_by_symbol(latest_info)
@@ -2168,6 +2153,30 @@ class AutoswapBot:
                     swap_fee=dict(used_swap_fee),
                 ),
             )
+            # --- Round-trip cycle spread loss tracking ---
+            cycle_tracker = self._get_cycle_tracker(account.name)
+            cycle_result = cycle_tracker.record_swap(
+                sell_symbol=hop.sell_symbol,
+                buy_symbol=hop.buy_symbol,
+                sell_amount=hop.sell_amount,
+                buy_amount=actual_output_amount,
+                network_fee=actual_network_fee,
+                swap_fee=actual_swap_fee,
+            )
+            if cycle_result is not None:
+                await self.monitor.record_cycle_spread_loss(
+                    monitor_card,
+                    cycle_result=cycle_result,
+                )
+                await self.monitor.log_event(
+                    monitor_card,
+                    (
+                        f"🔁 Cycle #{cycle_tracker.cycle_count} complete "
+                        f"({cycle_result.cycle_type}) | "
+                        f"{cycle_result.origin_symbol}: {cycle_result.start_amount} → {cycle_result.end_amount} | "
+                        f"loss={cycle_result.spread_loss}"
+                    ),
+                )
             await self._sleep_between_swaps()
         latest_info = await sdk.get_account_info()
         latest_balances = self._balances_by_symbol(latest_info)
@@ -3062,13 +3071,13 @@ class AutoswapBot:
 
         route = current_route
         stability_samples = max(1, self.config.runtime.fee_stability_samples)
-        oracle = self.fee_oracle
+        fee_history: list[Decimal] = []
 
-        # Sync oracle fee history to monitor card for dashboard display
-        oracle_fees = oracle.get_fee_history(sell_symbol, buy_symbol, limit=20)
-        if oracle_fees:
-            for fee_val in oracle_fees:
-                await self.monitor.update_fee_quote_history(monitor_card, fee_val)
+        # Record initial fee from current route into history
+        initial_fee = self._route_max_cc_fee(route)
+        if initial_fee is not None:
+            fee_history.append(initial_fee)
+            await self.monitor.update_fee_quote_history(monitor_card, initial_fee)
 
         while True:
             self._raise_if_stop_requested()
@@ -3104,27 +3113,25 @@ class AutoswapBot:
                     # Stability check disabled — langsung lolos jika fee ≤ cap
                     return route, None, None
 
-                # Check oracle avg for stability
-                oracle_sample_count = oracle.sample_count(sell_symbol, buy_symbol)
-                oracle_avg = oracle.get_avg_fee(sell_symbol, buy_symbol, stability_samples)
-
-                if oracle_sample_count >= stability_samples and oracle_avg is not None:
-                    if oracle_avg > fee_cap:
-                        # Oracle avg still above cap, keep waiting
-                        recent_fees = oracle.get_fee_history(sell_symbol, buy_symbol, limit=stability_samples)
-                        recent_text = ", ".join(f"{f}" for f in recent_fees)
+                # Stability check: rata-rata N quote terakhir <= cap?
+                if len(fee_history) >= stability_samples:
+                    recent = fee_history[-stability_samples:]
+                    avg = sum(recent) / len(recent)
+                    if avg > fee_cap:
+                        # Avg still above cap, keep waiting
+                        recent_text = ", ".join(f"{f}" for f in recent)
                         logger.warning(
-                            "Round %s fee quote OK tapi oracle avg(%s) = %s CC > batas %s CC [%s], terus tunggu",
+                            "Round %s fee quote OK tapi avg(%s) = %s CC > batas %s CC [%s], terus tunggu",
                             round_number,
                             stability_samples,
-                            oracle_avg,
+                            avg,
                             fee_cap,
                             recent_text,
                         )
                         await self.monitor.log_event(
                             monitor_card,
                             (
-                                f"📊 Fee saat ini OK tapi oracle avg({stability_samples}) = {oracle_avg} CC "
+                                f"📊 Fee saat ini OK tapi avg({stability_samples}) = {avg} CC "
                                 f"> batas {fee_cap} CC [{recent_text}], tunggu stabil"
                             ),
                         )
@@ -3132,27 +3139,26 @@ class AutoswapBot:
                         if violating_hop is None:
                             return route, None, None
                     else:
-                        # Oracle avg OK → stable
-                        recent_fees = oracle.get_fee_history(sell_symbol, buy_symbol, limit=stability_samples)
-                        recent_text = ", ".join(f"{f}" for f in recent_fees)
+                        # Avg OK → stable
+                        recent_text = ", ".join(f"{f}" for f in recent)
                         logger.info(
-                            "Round %s fee stabil (oracle): avg(%s) = %s CC ≤ batas %s CC [%s]",
+                            "Round %s fee stabil: avg(%s) = %s CC ≤ batas %s CC [%s]",
                             round_number,
                             stability_samples,
-                            oracle_avg,
+                            avg,
                             fee_cap,
                             recent_text,
                         )
                         await self.monitor.log_event(
                             monitor_card,
-                            f"✅ Fee stabil (oracle): avg({stability_samples}) = {oracle_avg} CC ≤ {fee_cap} CC",
+                            f"✅ Fee stabil: avg({stability_samples}) = {avg} CC ≤ {fee_cap} CC",
                         )
                         return route, None, None
                 else:
-                    # Not enough oracle samples yet, wait for more
-                    collected = oracle_sample_count
+                    # Not enough samples yet, wait for more
+                    collected = len(fee_history)
                     logger.info(
-                        "Round %s fee quote OK tapi oracle baru %s/%s samples, tunggu data fee lengkap",
+                        "Round %s fee quote OK tapi baru %s/%s samples, tunggu data fee lengkap",
                         round_number,
                         collected,
                         stability_samples,
@@ -3160,7 +3166,7 @@ class AutoswapBot:
                     await self.monitor.log_event(
                         monitor_card,
                         (
-                            f"📊 Fee OK tapi oracle baru {collected}/{stability_samples} samples, "
+                            f"📊 Fee OK tapi baru {collected}/{stability_samples} samples, "
                             f"tunggu data fee lengkap sebelum eksekusi"
                         ),
                     )
@@ -3208,26 +3214,16 @@ class AutoswapBot:
                     None,
                 )
 
-            # Calculate timeout for oracle wait
-            oracle_wait_timeout: float | None = None
-            if fee_retry_deadline_utc is not None:
-                seconds_left = (fee_retry_deadline_utc - now_utc).total_seconds()
-                if seconds_left <= 0:
-                    return (
-                        route,
-                        PlanIssue(
-                            round_number=round_number,
-                            sell_symbol=sell_symbol,
-                            requested_amount=actual_amount,
-                            available_amount=balances.get(sell_symbol, Decimal("0")),
-                            reason="network fee tetap di atas batas sampai 30 detik sebelum jadwal berikutnya",
-                        ),
-                        None,
-                    )
-                oracle_wait_timeout = max(1.0, seconds_left)
+            # Calculate poll sleep duration — adaptive based on fee proximity to cap
+            fast_range = self.config.runtime.fee_fast_poll_range
+            if fast_range is not None and fast_range[0] <= current_fee <= fast_range[1]:
+                # Fee is in fast poll range — poll every 1 second
+                poll_sleep = 1.0
+            else:
+                poll_sleep = self.config.runtime.network_fee_poll_seconds_range.sample(self._rng)
 
             logger.info(
-                "Round %s menunggu oracle fee turun | hop=%s/%s | %s -> %s | fee=%s CC | batas=%s CC",
+                "Round %s menunggu fee turun | hop=%s/%s | %s -> %s | fee=%s CC | batas=%s CC | poll %.0fs",
                 round_number,
                 violating_hop_index,
                 len(route.hops),
@@ -3235,50 +3231,36 @@ class AutoswapBot:
                 violating_hop_data.buy_symbol,
                 current_fee,
                 fee_cap,
+                poll_sleep,
             )
             await self.monitor.update_status(
                 monitor_card,
                 round_number=round_number,
                 phase="WAITING_FEE",
-                next_wait_seconds=oracle_wait_timeout,
+                next_wait_seconds=poll_sleep,
                 route_plan=route,
             )
 
-            # --- Use shared oracle instead of per-account polling ---
-            fee_ok = await oracle.wait_for_stable_fee(
-                sell_symbol,
-                buy_symbol,
-                fee_cap=fee_cap,
-                stability_samples=stability_samples,
-                stop_event=self._stop_requested,
-                timeout=oracle_wait_timeout,
-            )
-
+            # --- Per-account polling: sleep then re-quote ---
+            await self._sleep_or_stop(poll_sleep)
             self._raise_if_stop_requested()
 
-            # Sync oracle history to monitor card
-            latest_oracle_fees = oracle.get_fee_history(sell_symbol, buy_symbol, limit=stability_samples)
-            for fee_val in latest_oracle_fees:
-                await self.monitor.update_fee_quote_history(monitor_card, fee_val)
+            # Check deadline after sleep
+            now_utc = datetime.now(timezone.utc)
+            if fee_retry_deadline_utc is not None and now_utc >= fee_retry_deadline_utc:
+                return (
+                    route,
+                    PlanIssue(
+                        round_number=round_number,
+                        sell_symbol=sell_symbol,
+                        requested_amount=actual_amount,
+                        available_amount=balances.get(sell_symbol, Decimal("0")),
+                        reason="network fee tetap di atas batas sampai 30 detik sebelum jadwal berikutnya",
+                    ),
+                    None,
+                )
 
-            if not fee_ok:
-                # Timed out or stopped — check deadline
-                if fee_retry_deadline_utc is not None:
-                    now_utc = datetime.now(timezone.utc)
-                    if now_utc >= fee_retry_deadline_utc:
-                        return (
-                            route,
-                            PlanIssue(
-                                round_number=round_number,
-                                sell_symbol=sell_symbol,
-                                requested_amount=actual_amount,
-                                available_amount=balances.get(sell_symbol, Decimal("0")),
-                                reason="network fee tetap di atas batas sampai 30 detik sebelum jadwal berikutnya",
-                            ),
-                            None,
-                        )
-
-            # Re-quote per-account route with actual amounts after oracle says fee is OK
+            # Re-quote route per-akun
             info = await sdk.get_account_info()
             balances = self._balances_by_symbol(info)
             try:
@@ -3310,7 +3292,26 @@ class AutoswapBot:
                 continue
             if issue is not None:
                 return route, issue, None
+
+            # Record fee to history buffer + monitor card
+            new_fee = self._route_max_cc_fee(route)
+            if new_fee is not None:
+                fee_history.append(new_fee)
+                # Keep buffer bounded
+                if len(fee_history) > 50:
+                    fee_history = fee_history[-50:]
+                await self.monitor.update_fee_quote_history(monitor_card, new_fee)
+
         return route, None, None
+
+    def _route_max_cc_fee(self, route: RoutePlan) -> Decimal | None:
+        """Extract the maximum CC network fee from a route's hops."""
+        max_fee: Decimal | None = None
+        for hop in route.hops:
+            if hop.network_fee_symbol == CC_SYMBOL:
+                if max_fee is None or hop.network_fee_amount > max_fee:
+                    max_fee = hop.network_fee_amount
+        return max_fee
 
     def _first_network_fee_cap_violation(
         self,
@@ -3561,6 +3562,45 @@ class AutoswapBot:
 
         task.add_done_callback(_log_background_failure)
 
+    def _trigger_fee_scrape_if_available(
+        self,
+        *,
+        account_name: str,
+        completed_round: int,
+        monitor_card: TelegramCardState | None,
+    ) -> None:
+        """Trigger ccview.io fee scrape in background after swap success.
+
+        Non-blocking: creates a background task that scrapes ccview.io
+        and updates the monitor card with actual fee data.
+        """
+        party_id = self._account_party_ids.get(account_name, "")
+        if not party_id:
+            return
+
+        self.fee_scraper.trigger_background_scrape(
+            party_id=party_id,
+            account_name=account_name,
+            completed_round=completed_round,
+        )
+
+        # Schedule a delayed update to the monitor card with scrape results
+        if monitor_card is not None:
+            async def _update_card_with_scrape_result() -> None:
+                # Wait a bit for the scrape to complete
+                await asyncio.sleep(8)
+                result = self.fee_scraper.get_latest_result(account_name)
+                if result is not None and result.success:
+                    await self.monitor.update_ccview_fee(
+                        monitor_card,
+                        validator_fee_total=result.validator_fee_total,
+                        validator_tx_count=result.validator_tx_count,
+                        avg_fee_per_swap=result.avg_fee_per_swap,
+                    )
+
+            task = asyncio.create_task(_update_card_with_scrape_result())
+            task.add_done_callback(lambda t: None)  # Suppress unhandled exception
+
     def _merge_amount_maps(
         self,
         left: dict[str, Decimal],
@@ -3805,8 +3845,30 @@ class AutoswapBot:
         used_swap_fee: defaultdict[str, Decimal],
         result: AccountResult,
     ) -> None:
+        # Track tanggal UTC saat session dimulai untuk deteksi day change
+        _session_utc_date = datetime.now(timezone.utc).date().isoformat()
+
         while result.completed_rounds < prepared_run.rounds:
             self._raise_if_stop_requested()
+
+            # === Proactive daily reset: cek apakah hari UTC sudah berganti ===
+            was_reset, _session_utc_date = await self._check_and_reset_daily_progress(
+                account=account,
+                prepared_run=prepared_run,
+                result=result,
+                monitor_card=monitor_card,
+                logger=logger,
+                session_utc_date=_session_utc_date,
+            )
+            if was_reset:
+                logger.info(
+                    "Daily reset terjadi di awal loop | progress sekarang=%s/%s",
+                    result.completed_rounds,
+                    prepared_run.rounds,
+                )
+                # Setelah reset, lanjut loop dari awal dengan progress=0
+                continue
+
             if self._weekly_stop_due_utc():
                 await self._perform_weekly_stop(
                     logger=logger,
@@ -3914,6 +3976,12 @@ class AutoswapBot:
                     account=account,
                     prepared_run=prepared_run,
                     result=result,
+                )
+                # Trigger ccview.io fee scrape in background (non-blocking)
+                self._trigger_fee_scrape_if_available(
+                    account_name=account.name,
+                    completed_round=result.completed_rounds,
+                    monitor_card=monitor_card,
                 )
                 if self._weekly_stop_due_utc():
                     await self._perform_weekly_stop(
@@ -4213,86 +4281,80 @@ class AutoswapBot:
         logger: AccountLoggerAdapter,
         monitor_card: TelegramCardState | None,
     ) -> None:
-        first_wait = True
-        while True:
-            if self._weekly_stop_due_utc():
-                logger.info("Weekly stop jatuh tempo; tidak menunggu quota harian")
-                await self.monitor.log_event(
-                    monitor_card,
-                    "Weekly stop due, skip daily quota wait",
-                    force=True,
-                )
-                return
-
-            synced_completed_rounds = await self._sync_round_progress_from_trading_history(
-                sdk=sdk,
-                account=account,
-                prepared_run=prepared_run,
-                logger=logger,
-                monitor_card=monitor_card,
-                previous_completed_rounds=result.completed_rounds,
-                force_log=first_wait,
-            )
-            if synced_completed_rounds is not None:
-                result.completed_rounds = synced_completed_rounds
-                result.swap_transactions = synced_completed_rounds
-                self._persist_round_session_progress(
-                    account=account,
-                    prepared_run=prepared_run,
-                    result=result,
-                )
-
-            activity_summary = await self._fetch_activity_summary(sdk, logger)
-            if activity_summary is not None:
-                result.activity_summary = activity_summary
-                await self.monitor.update_activity(
-                    monitor_card,
-                    activity_summary,
-                    force=first_wait,
-                )
-
-            if result.completed_rounds < prepared_run.rounds:
-                logger.info(
-                    "Trading history hari ini sudah di bawah target | progress=%s/%s",
-                    result.completed_rounds,
-                    prepared_run.rounds,
-                )
-                await self.monitor.log_event(
-                    monitor_card,
-                    (
-                        "Trading history daily window refreshed: "
-                        f"{result.completed_rounds}/{prepared_run.rounds}"
-                    ),
-                    force=True,
-                )
-                return
-
-            wait_seconds = max(60.0, self._sample_network_fee_poll_seconds())
-            next_check_utc = datetime.now(timezone.utc) + timedelta(seconds=wait_seconds)
-            logger.info(
-                "Quota trading history harian masih tercapai | progress=%s/%s | cek ulang %s UTC",
-                result.completed_rounds,
-                prepared_run.rounds,
-                self._format_utc(next_check_utc),
-            )
-            await self.monitor.update_status(
-                monitor_card,
-                phase="WAITING_NEXT_DAY",
-                next_scheduled_utc=next_check_utc,
-                next_wait_seconds=wait_seconds,
-                clear_route=True,
-                force=first_wait,
-            )
+        """Tunggu sampai UTC midnight lalu reset progress. Tidak polling trading history."""
+        if self._weekly_stop_due_utc():
+            logger.info("Weekly stop jatuh tempo; tidak menunggu quota harian")
             await self.monitor.log_event(
                 monitor_card,
-                (
-                    "Daily quota reached, polling trading history "
-                    f"({result.completed_rounds}/{prepared_run.rounds})"
-                ),
-                force=first_wait,
+                "Weekly stop due, skip daily quota wait",
+                force=True,
             )
-            first_wait = False
-            await self._sleep_or_stop(wait_seconds)
+            return
+
+        # Hitung waktu sampai midnight UTC
+        now_utc = datetime.now(timezone.utc)
+        next_midnight_utc = self._next_utc_midnight(now_utc)
+        wait_seconds = max(1.0, (next_midnight_utc - now_utc).total_seconds())
+
+        logger.info(
+            "Quota harian tercapai (%s/%s) | Menunggu sampai %s UTC (%.0f detik)",
+            result.completed_rounds,
+            prepared_run.rounds,
+            self._format_utc(next_midnight_utc),
+            wait_seconds,
+        )
+        await self.monitor.update_status(
+            monitor_card,
+            phase="WAITING_NEXT_DAY",
+            next_scheduled_utc=next_midnight_utc,
+            next_wait_seconds=wait_seconds,
+            clear_route=True,
+            force=True,
+        )
+        await self.monitor.log_event(
+            monitor_card,
+            (
+                f"🌙 Daily quota reached ({result.completed_rounds}/{prepared_run.rounds}), "
+                f"sleeping until {self._format_utc(next_midnight_utc)} UTC"
+            ),
+            force=True,
+        )
+
+        # Sleep sampai midnight — cek weekly stop setiap 60 detik
+        sleep_chunk = 60.0
+        remaining = wait_seconds
+        while remaining > 0:
+            self._raise_if_stop_requested()
+            if self._weekly_stop_due_utc():
+                logger.info("Weekly stop jatuh tempo saat menunggu midnight")
+                await self.monitor.log_event(
+                    monitor_card,
+                    "Weekly stop due during midnight wait",
+                    force=True,
+                )
+                return
+            chunk = min(sleep_chunk, remaining)
+            await self._sleep_or_stop(chunk)
+            remaining -= chunk
+
+        # Setelah midnight — reset progress langsung
+        logger.info("🌅 UTC midnight tercapai — reset daily progress")
+        self._reset_result_round_progress_for_new_activity_window(
+            account=account,
+            prepared_run=prepared_run,
+            result=result,
+        )
+        result.skipped_rounds = 0
+
+        # Trigger monitor card rollover
+        if monitor_card is not None:
+            self.monitor._rollover_card_if_needed(monitor_card)
+
+        await self.monitor.log_event(
+            monitor_card,
+            f"🌅 Daily reset complete: progress=0/{prepared_run.rounds}",
+            force=True,
+        )
 
     async def _wait_until_next_utc_day_for_free_fee(
         self,
@@ -4378,6 +4440,59 @@ class AutoswapBot:
             requested_rounds=prepared_run.rounds,
             completed_rounds=0,
         )
+
+    async def _check_and_reset_daily_progress(
+        self,
+        *,
+        account: AccountConfig,
+        prepared_run: PreparedAccountRun,
+        result: AccountResult,
+        monitor_card: TelegramCardState | None,
+        logger: AccountLoggerAdapter,
+        session_utc_date: str,
+    ) -> tuple[bool, str]:
+        """Cek apakah hari UTC sudah berganti. Jika ya, reset progress ke 0.
+
+        Returns:
+            Tuple of (was_reset, current_utc_date_iso).
+            was_reset is True if a daily reset was performed.
+        """
+        current_utc_date = datetime.now(timezone.utc).date().isoformat()
+        if current_utc_date == session_utc_date:
+            return False, session_utc_date
+
+        # Hari UTC sudah berganti — reset progress
+        logger.info(
+            "🌅 Hari UTC berganti (%s → %s) | Reset daily progress ke 0",
+            session_utc_date,
+            current_utc_date,
+        )
+
+        # Reset result counters
+        result.completed_rounds = 0
+        result.swap_transactions = 0
+        result.skipped_rounds = 0
+
+        # Persist reset ke runtime state
+        self.runtime_state.update_round_session_progress(
+            account.name,
+            strategy_name=prepared_run.strategy_name,
+            requested_rounds=prepared_run.rounds,
+            completed_rounds=0,
+        )
+
+        # Trigger monitor card rollover
+        if monitor_card is not None:
+            self.monitor._rollover_card_if_needed(monitor_card)
+
+        # Log event to telegram
+        await self.monitor.log_event(
+            monitor_card,
+            f"🌅 Daily reset: {session_utc_date} → {current_utc_date} | progress=0/{prepared_run.rounds}",
+            force=True,
+        )
+
+        return True, current_utc_date
 
     async def _sleep_after_direct_24h_success(
         self,

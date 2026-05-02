@@ -187,6 +187,7 @@ class RuntimeConfig:
     max_network_fee_cc_per_execution: Decimal | None
     fee_stability_enabled: bool
     fee_stability_samples: int
+    fee_fast_poll_range: tuple[Decimal, Decimal] | None
     network_fee_poll_seconds_range: FloatRange
     full_24h_mode: bool
     full_24h_startup_mode: str
@@ -297,6 +298,16 @@ def load_config(path: str | Path) -> BotConfig:
         ),
         fee_stability_enabled=bool(settings.get("fee_stability_enabled", True)),
         fee_stability_samples=int(settings.get("fee_stability_samples", 3)),
+        fee_fast_poll_range=(
+            (
+                _to_decimal(settings["fee_fast_poll_range"]["min"], "settings.fee_fast_poll_range.min"),
+                _to_decimal(settings["fee_fast_poll_range"]["max"], "settings.fee_fast_poll_range.max"),
+            )
+            if isinstance(settings.get("fee_fast_poll_range"), dict)
+            and "min" in settings.get("fee_fast_poll_range", {})
+            and "max" in settings.get("fee_fast_poll_range", {})
+            else None
+        ),
         network_fee_poll_seconds_range=_parse_float_range(
             settings.get("network_fee_poll_seconds", 30.0),
             "settings.network_fee_poll_seconds",

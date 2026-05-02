@@ -12,11 +12,15 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import aiohttp
 
 from .config import AccountConfig, PreparedAccountRun, RuntimeConfig
 from .models import ActivitySummary, RoutePlan
+
+if TYPE_CHECKING:
+    from .cycle_tracker import CycleResult
 
 
 SYMBOL_SHORT = {
@@ -86,6 +90,12 @@ class TelegramCardState:
     session_finished_utc: datetime | None = None
     fee_quote_history: list[Decimal] = field(default_factory=list)
     total_spread_loss: dict[str, Decimal] = field(default_factory=dict)
+    total_cycle_spread_loss: dict[str, Decimal] = field(default_factory=dict)
+    cycle_count: int = 0
+    # CCView actual fee data (from fee_scraper)
+    ccview_validator_fee_total: Decimal = field(default_factory=lambda: Decimal("0"))
+    ccview_validator_tx_count: int = 0
+    ccview_avg_fee_per_swap: Decimal = field(default_factory=lambda: Decimal("0"))
     message_id: int | None = None
     last_render_text: str | None = None
     last_publish_monotonic: float = 0.0
@@ -124,7 +134,6 @@ class TelegramMonitor:
         self._session: aiohttp.ClientSession | None = None
         self._account_totals: dict[str, TelegramAccountTotals] = {}
         self._cards: dict[str, TelegramCardState] = {}
-        self._fee_oracle: Any | None = None
         self._terminal_logs: deque[str] = deque(
             maxlen=self.runtime.terminal_dashboard_logs_limit
         )
@@ -138,10 +147,6 @@ class TelegramMonitor:
         self._telegram_last_render_text: str | None = None
         self._telegram_last_publish_monotonic: float = 0.0
         self._publish_lock = asyncio.Lock()
-
-    def set_fee_oracle(self, oracle) -> None:
-        """Store a reference to the SharedFeeOracle for dashboard display."""
-        self._fee_oracle = oracle
 
     async def start(self) -> None:
         self._load_state()
@@ -330,6 +335,22 @@ class TelegramMonitor:
         self._rollover_card_if_needed(card)
         card.total_spread_loss[symbol] = card.total_spread_loss.get(symbol, Decimal("0")) + amount
 
+    async def record_cycle_spread_loss(
+        self,
+        card: TelegramCardState | None,
+        *,
+        cycle_result: CycleResult,
+    ) -> None:
+        """Record a completed round-trip cycle spread loss."""
+        if card is None:
+            return
+        self._rollover_card_if_needed(card)
+        symbol = cycle_result.origin_symbol
+        card.total_cycle_spread_loss[symbol] = (
+            card.total_cycle_spread_loss.get(symbol, Decimal("0")) + cycle_result.spread_loss
+        )
+        card.cycle_count += 1
+
     async def update_free_fee_status(
         self,
         card: TelegramCardState | None,
@@ -366,23 +387,22 @@ class TelegramMonitor:
         if len(card.fee_quote_history) > max_history:
             card.fee_quote_history = card.fee_quote_history[-max_history:]
 
-    async def sync_fee_from_oracle(
+    async def update_ccview_fee(
         self,
         card: TelegramCardState | None,
-        oracle_fees: list[Decimal],
         *,
-        max_history: int = 20,
+        validator_fee_total: Decimal,
+        validator_tx_count: int,
+        avg_fee_per_swap: Decimal,
+        force: bool = True,
     ) -> None:
-        """Replace the card's fee_quote_history with data from the shared oracle.
-
-        Called by the bot to keep the dashboard in sync with the oracle's
-        centralized fee history instead of per-account polling data.
-        """
+        """Update card with actual fee data from ccview.io scraper."""
         if card is None:
             return
-        if not oracle_fees:
-            return
-        card.fee_quote_history = list(oracle_fees[-max_history:])
+        card.ccview_validator_fee_total = validator_fee_total
+        card.ccview_validator_tx_count = validator_tx_count
+        card.ccview_avg_fee_per_swap = avg_fee_per_swap
+        await self._refresh_outputs(card, force=force)
 
     async def record_tx_success(
         self,
@@ -622,30 +642,24 @@ class TelegramMonitor:
         self._terminal_last_render_monotonic = now
 
     def _dashboard_col_widths(self) -> tuple[int, ...]:
-        return (12, 9, 10, 10, 12, 12, 24, 22, 14, 12, 12, 57)
+        # #, Akun, St, CC, Prog, Fee, Avg, Gas, Fr
+        return (2, 8, 3, 5, 5, 6, 5, 5, 3)
 
     def _dashboard_table_lines(self, cards: list[TelegramCardState]) -> tuple[tuple[int, ...], list[str]]:
         col_widths = self._dashboard_col_widths()
         lines = [
             self._table_row(
                 (
+                    "#",
                     "Akun",
-                    "Status",
+                    "St",
                     "CC",
-                    "USDCx",
-                    "CBTC",
-                    "Progress",
-                    "Plan",
-                    "Fee Route",
-                    "Fee Avg",
-                    "Distributed",
-                    "Funding",
-                    "Metrics",
+                    "Prog",
+                    "Fee",
+                    "Avg",
+                    "Gas",
+                    "Fr",
                 ),
-                col_widths,
-            ),
-            self._table_row(
-                ("", "", "", "", "", "", "", "", "", "", "", self._dashboard_metrics_header()),
                 col_widths,
             ),
             self._table_row(
@@ -653,22 +667,19 @@ class TelegramMonitor:
                 col_widths,
             ),
         ]
-        for card in cards:
+        for idx, card in enumerate(cards, start=1):
             lines.append(
                 self._table_row(
                     (
+                        str(idx),
                         card.account_name,
                         self._dashboard_status(card),
-                        self._fmt_balance(card.balances.get("CC", Decimal("0")), 4),
-                        self._fmt_balance(card.balances.get("USDCx", Decimal("0")), 4),
-                        self._fmt_balance(card.balances.get("CBTC", Decimal("0")), 8),
+                        self._fmt_balance(card.balances.get("CC", Decimal("0")), 2),
                         self._dashboard_progress(card),
-                        self._dashboard_plan(card),
-                        self._dashboard_route_fee(card),
+                        self._dashboard_route_fee_compact(card),
                         self._dashboard_fee_avg(card),
-                        self._dashboard_distributed(card),
-                        self._dashboard_funding(card),
-                        self._dashboard_metrics(card),
+                        self._dashboard_gas_compact(card),
+                        self._dashboard_free_compact(card),
                     ),
                     col_widths,
                 )
@@ -681,53 +692,38 @@ class TelegramMonitor:
         failed_accounts = sum(1 for card in cards if card.phase.startswith("FAILED"))
         stopped_accounts = sum(1 for card in cards if card.phase.startswith("STOPPED"))
         active_accounts = len(cards) - failed_accounts - stopped_accounts
-        local_now = datetime.now().astimezone()
+        utc_now = datetime.now(timezone.utc)
         yesterday_total = self._aggregate_rebate_total(cards, "yesterday")
         this_week_total = self._aggregate_rebate_total(cards, "this_week")
         distributed_total = self._aggregate_distributed_total(cards)
-        funding_total = self._aggregate_funding_total(cards)
         paid_fee_today = self._aggregate_current_day_total_fee(cards)
-        paid_fee_week = self._aggregate_current_week_total_fee(cards)
+        fee_cap = self.runtime.max_network_fee_cc_per_execution
+        fee_cap_text = f"{fee_cap}" if fee_cap is not None else "-"
         return [
             self._padded_line(
                 (
-                    f"Cantex Autoswap Bot | {local_now.strftime('%d/%m/%Y, %H.%M.%S %Z')} | "
-                    f"{len(cards)} akun | Mode: {self._dashboard_mode_label()}"
+                    f"Cantex Bot | {utc_now.strftime('%d/%m/%Y %H:%M')} UTC | "
+                    f"{len(cards)} akun | {self._dashboard_mode_label()}"
                 ),
                 row_width,
             ),
             self._padded_line(
                 (
-                    f"Swaps: {total_swaps}/{total_round_targets} total | "
-                    f"Active: {active_accounts} | Fail: {failed_accounts} | Stopped: {stopped_accounts}"
+                    f"Swaps: {total_swaps}/{total_round_targets} | "
+                    f"Active: {active_accounts} | Fee cap: {fee_cap_text} CC"
                 ),
                 row_width,
             ),
             self._padded_line(
                 (
-                    f"Rewards | yesterday: {self._format_cc_total(yesterday_total)} | "
-                    f"this week: {self._format_cc_total(this_week_total)}"
+                    f"Rewards: Y {self._format_cc_total(yesterday_total)} | "
+                    f"W {self._format_cc_total(this_week_total)} | "
+                    f"Dist: {self._format_cc_total(distributed_total)}"
                 ),
                 row_width,
             ),
             self._padded_line(
-                f"Reward distributed total: {self._format_cc_total(distributed_total)}",
-                row_width,
-            ),
-            self._padded_line(
-                f"Funding total (excl rewards/rebates): {self._format_cc_total(funding_total)}",
-                row_width,
-            ),
-            self._padded_line(
-                (
-                    "Fee paid (today | week, excl free): "
-                    f"{self._format_amount_map_display(paid_fee_today)} | "
-                    f"{self._format_amount_map_display(paid_fee_week)}"
-                ),
-                row_width,
-            ),
-            self._padded_line(
-                f"Fee oracle (live): {self._dashboard_oracle_fees_summary()}",
+                f"Fee paid: {self._format_amount_map_display(paid_fee_today)}",
                 row_width,
             ),
             self._padded_line(
@@ -753,100 +749,32 @@ class TelegramMonitor:
             return "starting"
         return "live"
 
-    def _dashboard_oracle_fees_summary(self) -> str:
-        """Build a compact summary of current oracle fees for all pairs.
-
-        Shows both current fee and average fee.
-        Format: CC->U now=0.31 avg=0.30 | CC->B now=0.45* avg=0.42*
-        """
-        oracle = self._fee_oracle
-        if oracle is None:
-            return "not started"
-
-        pair_labels = {
-            ("CC", "USDCx"): "CC->U",
-            ("CC", "CBTC"): "CC->B",
-            ("USDCx", "CC"): "U->CC",
-            ("USDCx", "CBTC"): "U->B",
-            ("CBTC", "CC"): "B->CC",
-            ("CBTC", "USDCx"): "B->U",
-        }
-        fee_cap = self.runtime.max_network_fee_cc_per_execution
-        stability_samples = max(1, self.runtime.fee_stability_samples)
-        cap_text = f"{fee_cap}" if fee_cap is not None else "-"
-        parts: list[str] = []
-        for (sell, buy), label in pair_labels.items():
-            current = oracle.get_current_fee(sell, buy)
-            avg = oracle.get_avg_fee(sell, buy, stability_samples)
-            if current is None:
-                parts.append(f"{label} -")
-            else:
-                cur_text = format(current, ".4f").rstrip("0").rstrip(".")
-                cur_marker = "*" if fee_cap is not None and current > fee_cap else ""
-                if avg is not None:
-                    avg_text = format(avg, ".4f").rstrip("0").rstrip(".")
-                    avg_marker = "*" if fee_cap is not None and avg > fee_cap else ""
-                    parts.append(f"{label} {cur_text}{cur_marker}/avg {avg_text}{avg_marker}")
-                else:
-                    parts.append(f"{label} {cur_text}{cur_marker}")
-        return f"{' | '.join(parts)} (cap={cap_text})"
-
-    def _oracle_log_line(self) -> str | None:
-        """Build a log line from oracle data for the execution logs section."""
-        oracle = self._fee_oracle
-        if oracle is None:
-            return None
-
-        fee_cap = self.runtime.max_network_fee_cc_per_execution
-        if fee_cap is None:
-            return None
-
-        pair_labels = {
-            ("CC", "USDCx"): "CC->U",
-            ("CC", "CBTC"): "CC->B",
-            ("USDCx", "CBTC"): "U->B",
-            ("CBTC", "USDCx"): "B->U",
-        }
-        parts: list[str] = []
-        for (sell, buy), label in pair_labels.items():
-            current = oracle.get_current_fee(sell, buy)
-            if current is not None:
-                cur_text = format(current, ".4f").rstrip("0").rstrip(".")
-                status = "OK" if current <= fee_cap else "HIGH"
-                parts.append(f"{label}={cur_text} {status}")
-        if not parts:
-            return None
-
-        from datetime import datetime
-        ts = datetime.now().astimezone().strftime("%H:%M:%S")
-        return f"[{ts}] [oracle] {' | '.join(parts)} (cap={fee_cap})"
-
     def _dashboard_status(self, card: TelegramCardState) -> str:
         if card.phase == "WAITING":
-            return "COOLDOWN"
+            return "CDN"
         if card.phase == "WAITING_FEE":
-            return "WAIT-FEE"
+            return "W-F"
         if card.phase == "WAITING_NEXT_DAY":
-            return "NEXT-DAY"
+            return "N-D"
         if card.phase == "PROCESSING":
-            return "PROCESS"
+            return "PRC"
         if card.phase == "COMPLETED":
             return "OK"
         if card.phase == "FINISHED":
-            return "FINISHED"
+            return "FIN"
+        if card.phase == "STARTING":
+            return "STR"
         if card.phase == "STOPPED_INSUFFICIENT_BALANCE":
-            return "SALDO"
+            return "SAL"
         if card.phase.startswith("FAILED"):
-            return "FAILED"
+            return "FAL"
         if card.phase.startswith("STOPPED"):
-            return "STOPPED"
-        return self._terminalize_text(card.phase)
+            return "STP"
+        return self._terminalize_text(card.phase)[:3]
 
     def _dashboard_progress(self, card: TelegramCardState) -> str:
         completed_total = self._progress_completed_total(card)
-        activity_24h_count = self._activity_24h_swap_count(card.activity_summary)
-        ok_total = activity_24h_count if activity_24h_count is not None else completed_total
-        return f"R{completed_total}/{card.total_rounds} ok{ok_total}"
+        return f"{completed_total}/{card.total_rounds}"
 
     def _dashboard_plan(self, card: TelegramCardState) -> str:
         strategy = self._build_strategy_line(card).split(":", 1)[-1].strip()
@@ -882,6 +810,34 @@ class TelegramMonitor:
             return f"S {swap_fee}"
         return f"N {network_fee} / S {swap_fee}"
 
+    def _dashboard_route_fee_compact(self, card: TelegramCardState) -> str:
+        """Compact fee route: just show network fee CC value."""
+        cc_fee = card.current_route_network_fee.get("CC")
+        if cc_fee is None or cc_fee == Decimal("0"):
+            return "-"
+        return f"{self._fmt_balance(cc_fee, 3)}"
+
+    def _dashboard_gas_compact(self, card: TelegramCardState) -> str:
+        """Compact gas fee today."""
+        day_fee = self._current_day_network_fee(card)
+        cc_fee = day_fee.get("CC", Decimal("0"))
+        if cc_fee <= 0:
+            return "-"
+        return self._fmt_balance(cc_fee, 2)
+
+    def _dashboard_free_compact(self, card: TelegramCardState) -> str:
+        """Compact free fee display: X/3."""
+        if card.daily_free_fee_limit <= 0:
+            return "-"
+        return f"{card.daily_free_fee_used}/{card.daily_free_fee_limit}"
+
+    def _ccview_fee_compact(self, card: TelegramCardState) -> str:
+        """Compact ccview actual fee display: avg_fee (tx_count tx)."""
+        if card.ccview_validator_tx_count <= 0:
+            return "-"
+        avg_text = format(card.ccview_avg_fee_per_swap, ".4f").rstrip("0").rstrip(".")
+        return f"{avg_text} CC/tx ({card.ccview_validator_tx_count}tx)"
+
     def _dashboard_distributed(self, card: TelegramCardState) -> str:
         summary = card.activity_summary
         if summary is None:
@@ -901,10 +857,8 @@ class TelegramMonitor:
             return "-"
         recent = card.fee_quote_history[-stability_samples:]
         avg = sum(recent) / len(recent)
-        count = len(recent)
-        # Format: "0.31 (3)" meaning avg=0.31 from 3 samples
-        avg_text = format(avg, ".4f").rstrip("0").rstrip(".")
-        return f"{avg_text} ({count})"
+        avg_text = format(avg, ".2f")
+        return avg_text
 
     def _dashboard_metrics(self, card: TelegramCardState) -> str:
         summary = card.activity_summary
@@ -913,12 +867,14 @@ class TelegramMonitor:
         gas_today = self._dashboard_gas(self._current_day_network_fee(card))
         free_fee = f"{card.daily_free_fee_used}/{card.daily_free_fee_limit}" if card.daily_free_fee_limit > 0 else "-"
         spread = self._format_spread_loss_compact(card.total_spread_loss)
+        cycle = self._format_cycle_spread_loss_compact(card)
         return self._compose_dashboard_metrics(
             yesterday,
             this_week,
             gas_today,
             free_fee,
             spread,
+            cycle,
         )
 
     def _dashboard_metrics_header(self) -> str:
@@ -928,6 +884,7 @@ class TelegramMonitor:
             "gas fee",
             "free swap",
             "spread",
+            "cycle loss",
             header=True,
         )
 
@@ -938,6 +895,7 @@ class TelegramMonitor:
         gas_fee: str,
         free_swap: str,
         spread_loss: str = "-",
+        cycle_loss: str = "-",
         *,
         header: bool = False,
     ) -> str:
@@ -948,6 +906,7 @@ class TelegramMonitor:
             self._align_terminal(gas_fee, 9, align=align),
             self._align_terminal(free_swap, 9, align=align),
             self._align_terminal(spread_loss, 12, align=align),
+            self._align_terminal(cycle_loss, 14, align=align),
         )
         return " | ".join(parts)
 
@@ -1152,6 +1111,7 @@ class TelegramMonitor:
         plan = self._combined_plan(card)
         fee_route = self._dashboard_route_fee(card)
         spread_loss = self._format_spread_loss_compact(card.total_spread_loss)
+        cycle_spread = self._format_cycle_spread_loss_compact(card)
         cc_balance = self._fmt_balance(card.balances.get("CC", Decimal("0")), 4)
         usdcx_balance = self._fmt_balance(card.balances.get("USDCx", Decimal("0")), 4)
         cbtc_balance = self._fmt_balance(card.balances.get("CBTC", Decimal("0")), 8)
@@ -1168,6 +1128,7 @@ class TelegramMonitor:
                     [
                         f"Fee route {fee_route}",
                         f"Spread {spread_loss}",
+                        f"Cycle {cycle_spread}",
                         f"24h {activity_24h}",
                         f"Y {yesterday_rebate}",
                         f"W {this_week_rebate}",
@@ -1175,6 +1136,7 @@ class TelegramMonitor:
                         f"Fund {funding_total}",
                         f"Gas {daily_fee_spent}",
                         f"Free {card.daily_free_fee_used}/{card.daily_free_fee_limit}",
+                        f"CCView {self._ccview_fee_compact(card)}",
                     ]
                 )
             ),
@@ -1664,6 +1626,23 @@ class TelegramMonitor:
             rendered = format(amount, ".6f").rstrip("0").rstrip(".")
             parts.append(f"{short} {rendered}")
         return ", ".join(parts) if parts else "-"
+
+    def _format_cycle_spread_loss_compact(self, card: TelegramCardState) -> str:
+        """Format round-trip cycle spread loss for compact display."""
+        values = card.total_cycle_spread_loss
+        if not values:
+            return "-"
+        parts: list[str] = []
+        for symbol, amount in sorted(values.items()):
+            if amount == Decimal("0"):
+                continue
+            short = SYMBOL_SHORT.get(symbol, symbol)
+            rendered = format(amount, ".6f").rstrip("0").rstrip(".")
+            parts.append(f"{short} {rendered}")
+        loss_text = ", ".join(parts) if parts else "-"
+        if card.cycle_count > 0:
+            return f"{loss_text} ({card.cycle_count}x)"
+        return loss_text
 
     def _format_amount_map(self, values: dict[str, Decimal]) -> str:
         if not values:
