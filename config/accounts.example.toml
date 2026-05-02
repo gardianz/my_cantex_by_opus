@@ -1,26 +1,44 @@
+# Cantex Autoswap Bot — Example Configuration
+# Copy this file to accounts.toml and fill in your keys
+
 [settings]
 base_url = "https://api.cantex.io"
 execution_mode = "sequential"
 max_concurrency = 1
-swap_delay_seconds = { min = 10.0, max = 30.0 }
-max_network_fee_cc_per_execution = "0.12"
-network_fee_poll_seconds = { min = 20.0, max = 40.0 }
+swap_delay_seconds = { min = 1.0, max = 1.0 }
+
+# Fee control
+max_network_fee_cc_per_execution = "0.36"    # Max fee per swap (CC)
+fee_stability_enabled = true                  # Cek rata-rata N quote sebelum swap
+fee_stability_samples = 3                     # Jumlah quote untuk rata-rata
+fee_fast_poll_range = { min = "0.30", max = "0.40" }  # Fee dalam range ini → poll 1 detik
+
+# Fee polling interval (detik) — digunakan saat fee di luar fast_poll_range
+network_fee_poll_seconds = { min = 5.0, max = 10.0 }
+
+# 24h mode
 full_24h_mode = true
-full_24h_startup_mode = "planned"
+full_24h_startup_mode = "direct"    # "direct" atau "planned"
 full_24h_min_gap_minutes = 5
 full_24h_auto_restart = true
 weekly_stop_on_monday_utc = true
 full_24h_schedule_log_limit = 12
 random_seed = ""
+
+# Telegram
 telegram_enabled = true
 telegram_bot_token = "env:TELEGRAM_BOT_TOKEN"
 telegram_chat_id = "env:TELEGRAM_CHAT_ID"
+
+# Dashboard
 terminal_dashboard_enabled = true
 terminal_dashboard_logs_limit = 20
 terminal_dashboard_min_interval_seconds = 0.25
 telegram_update_min_interval_seconds = 5
 telegram_latest_logs_limit = 6
-activity_enabled = false
+
+# Activity & misc
+activity_enabled = true
 activity_items_limit = 5
 dry_run = false
 log_level = "INFO"
@@ -29,11 +47,11 @@ max_retries = 3
 retry_base_delay = 5.0
 
 [defaults]
-strategy = "3"
-rounds = { min = 70, max = 72 }
-amounts = { CC = { min = "11", max = "13" }, USDCx = { min = "1.5", max = "1.7" }, CBTC = { min = "0.000023", max = "0.000025" } }
-reserve_fee = "5"
-# reserve_kritis = "1"
+strategy = "4"                    # 1=CC→USDCx, 2=CC→CBTC, 3=Cycle, 4=Reserve
+rounds = 26                       # Target swap per hari (bisa range: { min = 24, max = 28 })
+amounts = { CC = 13, USDCx = { min = "1.5", max = "1.7" }, CBTC = { min = "0.000023", max = "0.000025" } }
+reserve_fee = "1"                 # Minimum CC yang harus tersisa
+reserve_kritis = "1"              # Threshold darurat untuk recovery (wajib untuk strategy 4)
 
 [[accounts]]
 name = "wallet-1"
@@ -53,15 +71,13 @@ proxy_label = "No proxy"
 allow_continue_on_low_balance = true
 auto_create_intent_account = true
 
-[[accounts]]
-name = "wallet-3"
-enabled = false
-operator_key = "env:CANTEX_OPERATOR_KEY_3"
-trading_key = "env:CANTEX_TRADING_KEY_3"
-proxy_label = "No proxy"
-strategy = "4"
-rounds = { min = 6, max = 9 }
-reserve_fee = "5"
-reserve_kritis = "1"
-allow_continue_on_low_balance = true
-auto_create_intent_account = true
+# Contoh akun dengan override per-akun:
+# [[accounts]]
+# name = "wallet-3"
+# enabled = false
+# operator_key = "env:CANTEX_OPERATOR_KEY_3"
+# trading_key = "env:CANTEX_TRADING_KEY_3"
+# strategy = "3"                  # Override strategy
+# rounds = { min = 6, max = 9 }  # Override rounds
+# reserve_fee = "5"
+# reserve_kritis = "1"
