@@ -628,8 +628,8 @@ class TelegramMonitor:
         self._terminal_last_render_monotonic = now
 
     def _dashboard_col_widths(self) -> tuple[int, ...]:
-        # #, Akun, St, CC, USDCx, CBTC, Prog, Plan, Fee, Avg, Gas, AvgF, Dist, Fund, Fr
-        return (2, 8, 3, 6, 5, 10, 5, 16, 5, 5, 8, 5, 6, 5, 3)
+        # #, Akun, St, CC, USDCx, CBTC, Prog, Plan, Fee, Avg, Gas, AvgF, CyLoss, Dist, Fund, Fr
+        return (2, 8, 3, 6, 5, 10, 5, 16, 5, 5, 8, 5, 10, 6, 5, 3)
 
     def _dashboard_table_lines(self, cards: list[TelegramCardState]) -> tuple[tuple[int, ...], list[str]]:
         col_widths = self._dashboard_col_widths()
@@ -648,6 +648,7 @@ class TelegramMonitor:
                     "Avg",
                     "Gas",
                     "AvgF",
+                    "CyLoss",
                     "Dist",
                     "Fund",
                     "Fr",
@@ -675,6 +676,7 @@ class TelegramMonitor:
                         self._dashboard_fee_avg(card),
                         self._dashboard_gas_compact(card),
                         self._dashboard_ccview_avg_fee(card),
+                        self._format_cycle_spread_loss_compact(card),
                         self._dashboard_distributed_compact(card),
                         self._dashboard_funding_compact(card),
                         self._dashboard_free_compact(card),
