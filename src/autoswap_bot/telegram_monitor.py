@@ -642,8 +642,8 @@ class TelegramMonitor:
         self._terminal_last_render_monotonic = now
 
     def _dashboard_col_widths(self) -> tuple[int, ...]:
-        # #, Akun, St, CC, Prog, Fee, Avg, Gas, Fr
-        return (2, 8, 3, 5, 5, 6, 5, 5, 3)
+        # #, Akun, St, CC, USDCx, CBTC, Prog, Plan, Fee, Avg, Gas, Dist, Fund, Fr
+        return (2, 8, 3, 6, 5, 10, 5, 16, 5, 5, 5, 6, 5, 3)
 
     def _dashboard_table_lines(self, cards: list[TelegramCardState]) -> tuple[tuple[int, ...], list[str]]:
         col_widths = self._dashboard_col_widths()
@@ -654,10 +654,15 @@ class TelegramMonitor:
                     "Akun",
                     "St",
                     "CC",
+                    "USDCx",
+                    "CBTC",
                     "Prog",
+                    "Plan",
                     "Fee",
                     "Avg",
                     "Gas",
+                    "Dist",
+                    "Fund",
                     "Fr",
                 ),
                 col_widths,
@@ -675,10 +680,15 @@ class TelegramMonitor:
                         card.account_name,
                         self._dashboard_status(card),
                         self._fmt_balance(card.balances.get("CC", Decimal("0")), 2),
+                        self._fmt_balance(card.balances.get("USDCx", Decimal("0")), 2),
+                        self._fmt_balance(card.balances.get("CBTC", Decimal("0")), 8),
                         self._dashboard_progress(card),
+                        self._dashboard_plan(card),
                         self._dashboard_route_fee_compact(card),
                         self._dashboard_fee_avg(card),
                         self._dashboard_gas_compact(card),
+                        self._dashboard_distributed_compact(card),
+                        self._dashboard_funding_compact(card),
                         self._dashboard_free_compact(card),
                     ),
                     col_widths,
@@ -849,11 +859,42 @@ class TelegramMonitor:
             return "-"
         return self._distributed_amount_compact(summary.distributed_reward)
 
+    def _dashboard_distributed_compact(self, card: TelegramCardState) -> str:
+        """Compact distributed: just the number."""
+        summary = card.activity_summary
+        if summary is None:
+            return "-"
+        raw = summary.distributed_reward
+        if raw is None:
+            return "-"
+        # Extract just the number (remove " CC" suffix if present)
+        text = str(raw).replace(" CC", "").strip()
+        try:
+            val = Decimal(text)
+            return self._fmt_balance(val, 1)
+        except Exception:
+            return text[:5] if text else "-"
+
     def _dashboard_funding(self, card: TelegramCardState) -> str:
         summary = card.activity_summary
         if summary is None:
             return "-"
         return self._funding_amount_compact(summary.funding_total)
+
+    def _dashboard_funding_compact(self, card: TelegramCardState) -> str:
+        """Compact funding: just the number."""
+        summary = card.activity_summary
+        if summary is None:
+            return "-"
+        raw = summary.funding_total
+        if raw is None:
+            return "-"
+        text = str(raw).replace(" CC", "").strip()
+        try:
+            val = Decimal(text)
+            return self._fmt_balance(val, 0)
+        except Exception:
+            return text[:4] if text else "-"
 
     def _dashboard_fee_avg(self, card: TelegramCardState) -> str:
         """Show average of last N fee quotes from polling history."""
