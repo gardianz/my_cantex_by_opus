@@ -1,13 +1,22 @@
 """Round-trip cycle spread loss tracker.
 
-Tracks spread loss based on full round-trip cycles rather than individual swaps.
+Redesigned to handle all conditions:
+- USDCx=0 at start (cycle starts when first USDCx→CBTC happens)
+- CC→USDCx inflow (top-up, NOT part of USDCx cycle)
+- Strategy 4: CC→USDCx→CBTC→USDCx (CC→USDCx is top-up, cycle is USDCx→CBTC→USDCx)
+- Restart mid-cycle (graceful reset)
 
 Cycle types:
-- USDCx cycle: USDCx → CBTC → USDCx  (spread_loss = USDCx_start - USDCx_end)
-- CC cycle: CC → foreign → CC  (spread_loss = CC_start - CC_end, excluding fees)
+- USDCx Cycle: USDCx → CBTC → USDCx
+  - Start: when USDCx→CBTC swap happens, record sell_amount (USDCx out)
+  - End: when CBTC→USDCx swap happens, record buy_amount (USDCx in)
+  - Loss = sell_amount_start - buy_amount_end
+  - CC→USDCx is IGNORED (it's a top-up, not part of cycle)
 
-For strategy_4_reserve, the recycle pattern is USDCx ↔ CBTC which forms
-1 cycle per 2 swaps.
+- CC Cycle: CC → foreign → CC
+  - Start: when CC→USDCx or CC→CBTC swap happens, record CC sell_amount
+  - End: when USDCx→CC or CBTC→CC swap happens, record CC buy_amount
+  - Loss = CC_out - CC_in (WITHOUT fee, fee is tracked separately)
 """
 
 from __future__ import annotations
@@ -23,15 +32,6 @@ logger = logging.getLogger("autoswap_bot.cycle_tracker")
 
 
 @dataclass
-class CycleState:
-    """Tracks a single in-progress cycle."""
-
-    origin_symbol: str  # The symbol that starts and ends the cycle
-    start_amount: Decimal  # Amount of origin_symbol when cycle started
-    phase: str = "idle"  # "idle", "out", "back"
-
-
-@dataclass
 class CycleResult:
     """Result of a completed cycle."""
 
@@ -43,27 +43,41 @@ class CycleResult:
 
 
 @dataclass
+class PendingUSDCxCycle:
+    """Tracks an in-progress USDCx cycle (USDCx → CBTC → USDCx)."""
+
+    sell_amount: Decimal  # USDCx that went out
+    active: bool = True
+
+
+@dataclass
+class PendingCCCycle:
+    """Tracks an in-progress CC cycle (CC → foreign → CC)."""
+
+    sell_amount: Decimal  # CC that went out
+    target_symbol: str  # "USDCx" or "CBTC"
+    active: bool = True
+
+
+@dataclass
 class CycleTracker:
     """Tracks round-trip cycle spread losses for a single account.
 
-    USDCx cycle: USDCx → CBTC → USDCx
-      - Phase "out": USDCx sold for CBTC, record USDCx start amount
-      - Phase "back": CBTC sold for USDCx, compute loss
-
-    CC cycle: CC → foreign → CC
-      - Phase "out": CC sold for foreign, record CC start amount
-      - Phase "back": foreign sold for CC, compute loss
+    Design principles:
+    - USDCx Cycle: Only tracks USDCx→CBTC + CBTC→USDCx pairs
+      - CC→USDCx is IGNORED (top-up, not cycle start)
+      - USDCx→CC is IGNORED (not part of USDCx↔CBTC cycle)
+    - CC Cycle: Tracks CC→foreign + foreign→CC pairs
+      - Network fee is excluded from loss calculation
+    - Handles USDCx=0 start gracefully (no cycle until USDCx→CBTC happens)
+    - Handles restart mid-cycle (stale pending cycles are overwritten)
     """
 
-    # USDCx ↔ CBTC cycle state
-    usdcx_cycle: CycleState = field(
-        default_factory=lambda: CycleState(origin_symbol="USDCx", start_amount=Decimal("0"))
-    )
+    # Pending USDCx cycle (USDCx → CBTC, waiting for CBTC → USDCx)
+    _pending_usdcx: PendingUSDCxCycle | None = None
 
-    # CC ↔ foreign cycle state
-    cc_cycle: CycleState = field(
-        default_factory=lambda: CycleState(origin_symbol="CC", start_amount=Decimal("0"))
-    )
+    # Pending CC cycle (CC → foreign, waiting for foreign → CC)
+    _pending_cc: PendingCCCycle | None = None
 
     # Accumulated losses
     total_usdcx_spread_loss: Decimal = field(default_factory=lambda: Decimal("0"))
@@ -94,107 +108,134 @@ class CycleTracker:
         Returns:
             CycleResult if a round-trip cycle just completed, None otherwise.
         """
-        result: CycleResult | None = None
-
         # --- USDCx ↔ CBTC cycle detection ---
         if sell_symbol == "USDCx" and buy_symbol == "CBTC":
             # Starting USDCx cycle: USDCx going out to CBTC
-            self.usdcx_cycle.start_amount = sell_amount
-            self.usdcx_cycle.phase = "out"
+            # If there's already a pending cycle, overwrite it (restart mid-cycle)
+            if self._pending_usdcx is not None and self._pending_usdcx.active:
+                logger.debug(
+                    "USDCx cycle restarted (previous pending overwritten): "
+                    "old_start=%s, new_start=%s",
+                    self._pending_usdcx.sell_amount,
+                    sell_amount,
+                )
+            self._pending_usdcx = PendingUSDCxCycle(sell_amount=sell_amount)
             logger.debug(
                 "USDCx cycle started: sell_amount=%s USDCx → CBTC",
                 sell_amount,
             )
+            return None
 
-        elif sell_symbol == "CBTC" and buy_symbol == "USDCx":
+        if sell_symbol == "CBTC" and buy_symbol == "USDCx":
             # Completing USDCx cycle: CBTC coming back to USDCx
-            if self.usdcx_cycle.phase == "out":
+            if self._pending_usdcx is not None and self._pending_usdcx.active:
                 end_amount = buy_amount
-                spread_loss = self.usdcx_cycle.start_amount - end_amount
+                spread_loss = self._pending_usdcx.sell_amount - end_amount
                 result = CycleResult(
                     origin_symbol="USDCx",
-                    start_amount=self.usdcx_cycle.start_amount,
+                    start_amount=self._pending_usdcx.sell_amount,
                     end_amount=end_amount,
                     spread_loss=spread_loss,
                     cycle_type="usdcx_cbtc",
                 )
                 self.total_usdcx_spread_loss += spread_loss
                 self.cycle_count += 1
-                self.cycle_history.append(result)
-                # Keep history bounded
-                if len(self.cycle_history) > 100:
-                    self.cycle_history = self.cycle_history[-50:]
+                self._append_history(result)
                 logger.info(
                     "USDCx cycle completed: %s → %s USDCx | spread_loss=%s USDCx | total=%s",
-                    self.usdcx_cycle.start_amount,
+                    self._pending_usdcx.sell_amount,
                     end_amount,
                     spread_loss,
                     self.total_usdcx_spread_loss,
                 )
-                self.usdcx_cycle.phase = "idle"
-                self.usdcx_cycle.start_amount = Decimal("0")
+                # Reset pending
+                self._pending_usdcx = None
+                return result
             else:
-                # CBTC → USDCx without a prior USDCx → CBTC (e.g., recovery swap)
+                # CBTC → USDCx without a prior USDCx → CBTC
+                # This can happen in recovery swaps or strategy changes
                 logger.debug(
-                    "CBTC → USDCx swap without active USDCx cycle (phase=%s), ignoring",
-                    self.usdcx_cycle.phase,
+                    "CBTC → USDCx swap without active USDCx cycle, ignoring for cycle tracking",
                 )
+                return None
 
         # --- CC ↔ foreign cycle detection ---
-        elif sell_symbol == CC_SYMBOL and buy_symbol in ("USDCx", "CBTC"):
+        if sell_symbol == CC_SYMBOL and buy_symbol in ("USDCx", "CBTC"):
             # Starting CC cycle: CC going out to foreign
-            self.cc_cycle.start_amount = sell_amount
-            self.cc_cycle.phase = "out"
+            # Overwrite any existing pending CC cycle (restart mid-cycle)
+            if self._pending_cc is not None and self._pending_cc.active:
+                logger.debug(
+                    "CC cycle restarted (previous pending overwritten): "
+                    "old_start=%s CC→%s, new_start=%s CC→%s",
+                    self._pending_cc.sell_amount,
+                    self._pending_cc.target_symbol,
+                    sell_amount,
+                    buy_symbol,
+                )
+            self._pending_cc = PendingCCCycle(
+                sell_amount=sell_amount,
+                target_symbol=buy_symbol,
+            )
             logger.debug(
                 "CC cycle started: sell_amount=%s CC → %s",
                 sell_amount,
                 buy_symbol,
             )
+            return None
 
-        elif sell_symbol in ("USDCx", "CBTC") and buy_symbol == CC_SYMBOL:
+        if sell_symbol in ("USDCx", "CBTC") and buy_symbol == CC_SYMBOL:
             # Completing CC cycle: foreign coming back to CC
-            if self.cc_cycle.phase == "out":
-                # For CC cycle, the spread loss is CC_start - CC_end
-                # We need to exclude fees from the calculation.
-                # The buy_amount is the net CC received (after swap fee deduction
-                # from the swap itself, but network fee is separate).
-                # Since network fee is charged separately and we want to exclude it,
-                # we add back any CC network fee that was charged on this leg.
+            if self._pending_cc is not None and self._pending_cc.active:
+                # For CC cycle, spread loss = CC_start - CC_end
+                # We EXCLUDE network fee from loss calculation because fee is tracked separately.
+                # buy_amount is the net CC received after swap.
+                # Network fee is charged separately on CC, so we add it back to get
+                # the "true" CC output before fee deduction.
                 cc_network_fee = Decimal("0")
                 if network_fee:
                     cc_network_fee = network_fee.get(CC_SYMBOL, Decimal("0"))
 
                 end_amount = buy_amount + cc_network_fee
-                spread_loss = self.cc_cycle.start_amount - end_amount
+                spread_loss = self._pending_cc.sell_amount - end_amount
                 result = CycleResult(
                     origin_symbol="CC",
-                    start_amount=self.cc_cycle.start_amount,
+                    start_amount=self._pending_cc.sell_amount,
                     end_amount=end_amount,
                     spread_loss=spread_loss,
                     cycle_type="cc_foreign",
                 )
                 self.total_cc_spread_loss += spread_loss
                 self.cycle_count += 1
-                self.cycle_history.append(result)
-                if len(self.cycle_history) > 100:
-                    self.cycle_history = self.cycle_history[-50:]
+                self._append_history(result)
                 logger.info(
                     "CC cycle completed: %s → %s CC (excl fee) | spread_loss=%s CC | total=%s",
-                    self.cc_cycle.start_amount,
+                    self._pending_cc.sell_amount,
                     end_amount,
                     spread_loss,
                     self.total_cc_spread_loss,
                 )
-                self.cc_cycle.phase = "idle"
-                self.cc_cycle.start_amount = Decimal("0")
+                # Reset pending
+                self._pending_cc = None
+                return result
             else:
+                # foreign → CC without active CC cycle (e.g., recovery swap)
                 logger.debug(
-                    "%s → CC swap without active CC cycle (phase=%s), ignoring",
+                    "%s → CC swap without active CC cycle, ignoring for cycle tracking",
                     sell_symbol,
-                    self.cc_cycle.phase,
                 )
+                return None
 
-        return result
+        # --- Swaps that are NOT part of any cycle ---
+        # CC→USDCx when there's no pending CC cycle: this is a top-up, ignore
+        # USDCx→CC: not part of USDCx↔CBTC cycle, ignore
+        # Any other pair: ignore
+        return None
+
+    def _append_history(self, result: CycleResult) -> None:
+        """Append to history with bounded size."""
+        self.cycle_history.append(result)
+        if len(self.cycle_history) > 100:
+            self.cycle_history = self.cycle_history[-50:]
 
     def get_summary(self) -> dict[str, Any]:
         """Return a summary dict for display purposes."""
@@ -202,8 +243,8 @@ class CycleTracker:
             "total_usdcx_spread_loss": self.total_usdcx_spread_loss,
             "total_cc_spread_loss": self.total_cc_spread_loss,
             "cycle_count": self.cycle_count,
-            "usdcx_cycle_phase": self.usdcx_cycle.phase,
-            "cc_cycle_phase": self.cc_cycle.phase,
+            "usdcx_cycle_pending": self._pending_usdcx is not None and self._pending_usdcx.active,
+            "cc_cycle_pending": self._pending_cc is not None and self._pending_cc.active,
         }
 
     def get_total_spread_loss_map(self) -> dict[str, Decimal]:
@@ -217,8 +258,8 @@ class CycleTracker:
 
     def reset(self) -> None:
         """Reset all tracking state."""
-        self.usdcx_cycle = CycleState(origin_symbol="USDCx", start_amount=Decimal("0"))
-        self.cc_cycle = CycleState(origin_symbol="CC", start_amount=Decimal("0"))
+        self._pending_usdcx = None
+        self._pending_cc = None
         self.total_usdcx_spread_loss = Decimal("0")
         self.total_cc_spread_loss = Decimal("0")
         self.cycle_count = 0

@@ -6,14 +6,17 @@ network fee aktual yang benar-benar dipotong oleh validator.
 Reuses logic dari ccview_scraper/scraper.py tapi didesain untuk:
 - Async background (tidak blocking swap flow)
 - Lazy session init (sekali saja)
-- Rate limit: max 1 scrape per akun per swap
+- Rate limit: cooldown-based (min 5s between scrapes per account)
+- Trigger setiap swap hop sukses (bukan hanya per round)
 - Graceful fallback jika gagal
+- Periodic scrape fallback setiap N detik
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -27,6 +30,12 @@ PARTY_INFO_URL = "https://ccview.io/api/v1/internal/api/v1/parties"
 MAX_RETRIES = 2
 REQUEST_TIMEOUT = 20.0
 VALIDATOR_PATTERNS = ("cantex-validator", "Cantex-validator")
+# Minimum seconds between scrapes for the same account (avoid spam)
+MIN_SCRAPE_COOLDOWN_SECONDS = 5.0
+# Delay before scraping after a swap (ccview.io needs time to index)
+SCRAPE_DELAY_AFTER_SWAP_SECONDS = 5.0
+# Periodic scrape interval (fallback) in seconds
+PERIODIC_SCRAPE_INTERVAL_SECONDS = 120.0
 
 
 @dataclass
@@ -51,8 +60,10 @@ class FeeScraper:
     Features:
     - Lazy session init (visit homepage + /api/v1/session sekali)
     - Shared session untuk semua akun
-    - Rate limit: max 1 scrape per akun per trigger
-    - Background async (tidak blocking swap flow)
+    - Cooldown-based rate limit: min 5s between scrapes per account
+    - Triggered after every successful swap hop (non-blocking)
+    - Small delay before scrape (ccview.io needs indexing time)
+    - Periodic scrape fallback
     - Graceful fallback jika gagal
     """
 
@@ -62,12 +73,14 @@ class FeeScraper:
         self._session_initialized = False
         self._init_lock = asyncio.Lock()
         self._scrape_lock = asyncio.Lock()
-        # Track last scrape per account to avoid spam
-        self._last_scrape_round: dict[str, int] = {}
+        # Track last scrape time per account (monotonic) for cooldown
+        self._last_scrape_time: dict[str, float] = {}
         # Store latest results per account
         self._latest_results: dict[str, ActualFeeResult] = {}
         # Background tasks
         self._background_tasks: set[asyncio.Task] = set()
+        # Periodic scrape tasks
+        self._periodic_tasks: dict[str, asyncio.Task] = {}
 
     async def _ensure_client(self) -> httpx.AsyncClient:
         """Lazy init httpx client with session."""
@@ -255,17 +268,24 @@ class FeeScraper:
     ) -> None:
         """Trigger a background scrape (non-blocking).
 
-        Rate limited: max 1 scrape per account per round.
+        Cooldown-based: min 5s between scrapes for the same account.
+        Called after every successful swap hop.
         """
         if not party_id:
             return
 
-        # Rate limit: skip if already scraped this round
-        last_round = self._last_scrape_round.get(account_name, -1)
-        if last_round >= completed_round:
+        # Cooldown check: skip if last scrape was too recent
+        now = time.monotonic()
+        last_time = self._last_scrape_time.get(account_name, 0.0)
+        if now - last_time < MIN_SCRAPE_COOLDOWN_SECONDS:
+            self.log.debug(
+                "CCView scrape skipped for %s: cooldown (%.1fs since last)",
+                account_name,
+                now - last_time,
+            )
             return
 
-        self._last_scrape_round[account_name] = completed_round
+        self._last_scrape_time[account_name] = now
 
         # Create background task
         task = asyncio.create_task(
@@ -285,8 +305,11 @@ class FeeScraper:
         account_name: str,
         completed_round: int,
     ) -> None:
-        """Background scrape task."""
+        """Background scrape task with delay for ccview.io indexing."""
         try:
+            # Wait a bit for ccview.io to index the transaction
+            await asyncio.sleep(SCRAPE_DELAY_AFTER_SWAP_SECONDS)
+
             today = datetime.now(timezone.utc).date().isoformat()
             async with self._scrape_lock:
                 result = await self.fetch_actual_fee(party_id, today)
@@ -311,12 +334,72 @@ class FeeScraper:
                     completed_round,
                     result.error,
                 )
+        except asyncio.CancelledError:
+            pass
         except Exception as exc:
             self.log.warning(
                 "CCView background scrape exception | %s | %s",
                 account_name,
                 exc,
             )
+
+    def start_periodic_scrape(
+        self,
+        *,
+        party_id: str,
+        account_name: str,
+    ) -> None:
+        """Start a periodic background scrape for an account (fallback).
+
+        Scrapes every PERIODIC_SCRAPE_INTERVAL_SECONDS as a fallback
+        in case per-hop triggers miss updates.
+        """
+        if not party_id:
+            return
+        if account_name in self._periodic_tasks:
+            return  # Already running
+
+        task = asyncio.create_task(
+            self._periodic_scrape_loop(
+                party_id=party_id,
+                account_name=account_name,
+            )
+        )
+        self._periodic_tasks[account_name] = task
+        task.add_done_callback(lambda t: self._periodic_tasks.pop(account_name, None))
+
+    async def _periodic_scrape_loop(
+        self,
+        *,
+        party_id: str,
+        account_name: str,
+    ) -> None:
+        """Periodic scrape loop — runs until cancelled."""
+        try:
+            while True:
+                await asyncio.sleep(PERIODIC_SCRAPE_INTERVAL_SECONDS)
+                try:
+                    today = datetime.now(timezone.utc).date().isoformat()
+                    async with self._scrape_lock:
+                        result = await self.fetch_actual_fee(party_id, today)
+                    if result.success:
+                        self._latest_results[account_name] = result
+                        self._last_scrape_time[account_name] = time.monotonic()
+                        self.log.debug(
+                            "CCView periodic scrape OK | %s | "
+                            "validator_fee=%s CC (%s tx)",
+                            account_name,
+                            result.validator_fee_total,
+                            result.validator_tx_count,
+                        )
+                except Exception as exc:
+                    self.log.debug(
+                        "CCView periodic scrape error | %s | %s",
+                        account_name,
+                        exc,
+                    )
+        except asyncio.CancelledError:
+            pass
 
     def get_latest_result(self, account_name: str) -> ActualFeeResult | None:
         """Get the latest scrape result for an account."""
@@ -336,6 +419,11 @@ class FeeScraper:
 
     async def close(self) -> None:
         """Close the HTTP client and cancel background tasks."""
+        # Cancel periodic tasks
+        for task in list(self._periodic_tasks.values()):
+            task.cancel()
+        self._periodic_tasks.clear()
+
         # Cancel all background tasks
         for task in list(self._background_tasks):
             task.cancel()

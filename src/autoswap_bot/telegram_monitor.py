@@ -89,7 +89,6 @@ class TelegramCardState:
     next_wait_seconds: float | None = None
     session_finished_utc: datetime | None = None
     fee_quote_history: list[Decimal] = field(default_factory=list)
-    total_spread_loss: dict[str, Decimal] = field(default_factory=dict)
     total_cycle_spread_loss: dict[str, Decimal] = field(default_factory=dict)
     cycle_count: int = 0
     # CCView actual fee data (from fee_scraper)
@@ -321,19 +320,6 @@ class TelegramMonitor:
         card.total_swap_fee = dict(total_swap_fee)
         self._persist_card_state(card)
         await self._refresh_outputs(card, force=force)
-
-    async def record_spread_loss(
-        self,
-        card: TelegramCardState | None,
-        *,
-        symbol: str,
-        amount: Decimal,
-    ) -> None:
-        """Accumulate spread loss (expected_output - actual_output) for a hop."""
-        if card is None:
-            return
-        self._rollover_card_if_needed(card)
-        card.total_spread_loss[symbol] = card.total_spread_loss.get(symbol, Decimal("0")) + amount
 
     async def record_cycle_spread_loss(
         self,
@@ -912,15 +898,13 @@ class TelegramMonitor:
         this_week = self._rebate_amount_compact(summary.rebates.get("this_week")) if summary else "-"
         gas_today = self._dashboard_gas(self._current_day_network_fee(card))
         free_fee = f"{card.daily_free_fee_used}/{card.daily_free_fee_limit}" if card.daily_free_fee_limit > 0 else "-"
-        spread = self._format_spread_loss_compact(card.total_spread_loss)
         cycle = self._format_cycle_spread_loss_compact(card)
         return self._compose_dashboard_metrics(
             yesterday,
             this_week,
             gas_today,
             free_fee,
-            spread,
-            cycle,
+            cycle_loss=cycle,
         )
 
     def _dashboard_metrics_header(self) -> str:
@@ -929,7 +913,6 @@ class TelegramMonitor:
             "t week",
             "gas fee",
             "free swap",
-            "spread",
             "cycle loss",
             header=True,
         )
@@ -940,7 +923,6 @@ class TelegramMonitor:
         this_week: str,
         gas_fee: str,
         free_swap: str,
-        spread_loss: str = "-",
         cycle_loss: str = "-",
         *,
         header: bool = False,
@@ -951,7 +933,6 @@ class TelegramMonitor:
             self._align_terminal(this_week, 8, align=align),
             self._align_terminal(gas_fee, 9, align=align),
             self._align_terminal(free_swap, 9, align=align),
-            self._align_terminal(spread_loss, 12, align=align),
             self._align_terminal(cycle_loss, 14, align=align),
         )
         return " | ".join(parts)
@@ -1156,7 +1137,6 @@ class TelegramMonitor:
         progress = self._dashboard_progress(card)
         plan = self._combined_plan(card)
         fee_route = self._dashboard_route_fee(card)
-        spread_loss = self._format_spread_loss_compact(card.total_spread_loss)
         cycle_spread = self._format_cycle_spread_loss_compact(card)
         cc_balance = self._fmt_balance(card.balances.get("CC", Decimal("0")), 4)
         usdcx_balance = self._fmt_balance(card.balances.get("USDCx", Decimal("0")), 4)
@@ -1173,7 +1153,6 @@ class TelegramMonitor:
                 " | ".join(
                     [
                         f"Fee route {fee_route}",
-                        f"Spread {spread_loss}",
                         f"Cycle {cycle_spread}",
                         f"24h {activity_24h}",
                         f"Y {yesterday_rebate}",
@@ -1658,19 +1637,6 @@ class TelegramMonitor:
             if rendered == "0":
                 continue
             parts.append(f"{rendered} {symbol}")
-        return ", ".join(parts) if parts else "-"
-
-    def _format_spread_loss_compact(self, values: dict[str, Decimal]) -> str:
-        """Format spread loss map for compact display (Telegram / dashboard)."""
-        if not values:
-            return "-"
-        parts: list[str] = []
-        for symbol, amount in sorted(values.items()):
-            if amount == Decimal("0"):
-                continue
-            short = SYMBOL_SHORT.get(symbol, symbol)
-            rendered = format(amount, ".6f").rstrip("0").rstrip(".")
-            parts.append(f"{short} {rendered}")
         return ", ".join(parts) if parts else "-"
 
     def _format_cycle_spread_loss_compact(self, card: TelegramCardState) -> str:

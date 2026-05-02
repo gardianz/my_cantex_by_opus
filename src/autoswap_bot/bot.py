@@ -213,6 +213,11 @@ class AutoswapBot:
                 # Store party_id for ccview fee scraper
                 if info.address:
                     self._account_party_ids[account.name] = info.address
+                    # Start periodic background scrape as fallback
+                    self.fee_scraper.start_periodic_scrape(
+                        party_id=info.address,
+                        account_name=account.name,
+                    )
                 await self.monitor.log_event(
                     monitor_card,
                     f"🗓️ Ready for {prepared_run.rounds} swap rounds",
@@ -1559,18 +1564,10 @@ class AutoswapBot:
             )
             tx_identifier = tx_result.get("id") or tx_result.get("transactionId") or tx_result.get("contract_id")
             actual_output_amount = self._parse_decimal_like(tx_result.get("output_amount")) or hop.returned_amount
-            # --- Spread loss & slippage calculation ---
-            spread_loss = hop.returned_amount - actual_output_amount
             slippage_pct = hop.slippage
-            if spread_loss > Decimal("0"):
-                await self.monitor.record_spread_loss(
-                    monitor_card,
-                    symbol=hop.buy_symbol,
-                    amount=spread_loss,
-                )
             logger.info(
                 "Tx hop %s/%s berhasil | %s -> %s | tx=%s | output=%s %s | "
-                "expected=%s | spread_loss=%s | slippage=%s%%",
+                "expected=%s | slippage=%s%%",
                 hop_index,
                 len(route.hops),
                 hop.sell_symbol,
@@ -1579,7 +1576,6 @@ class AutoswapBot:
                 actual_output_amount,
                 hop.buy_symbol,
                 hop.returned_amount,
-                spread_loss,
                 slippage_pct,
             )
             await self.monitor.log_event(
@@ -1587,7 +1583,7 @@ class AutoswapBot:
                 (
                     f"✅ Hop {hop_index}/{len(route.hops)} {hop.sell_symbol}->{hop.buy_symbol} "
                     f"tx={tx_identifier or '-'} | "
-                    f"slip={slippage_pct}% spread={spread_loss} {hop.buy_symbol}"
+                    f"out={actual_output_amount} slip={slippage_pct}%"
                 ),
             )
             await self.monitor.log_event(
@@ -1630,6 +1626,12 @@ class AutoswapBot:
                         f"loss={cycle_result.spread_loss}"
                     ),
                 )
+            # Trigger ccview.io fee scrape after each successful hop (non-blocking)
+            self._trigger_fee_scrape_if_available(
+                account_name=account.name,
+                completed_round=round_number,
+                monitor_card=monitor_card,
+            )
             await self._sleep_between_swaps()
         latest_info = await sdk.get_account_info()
         latest_balances = self._balances_by_symbol(latest_info)
@@ -2106,18 +2108,10 @@ class AutoswapBot:
             )
             tx_identifier = tx_result.get("id") or tx_result.get("transactionId") or tx_result.get("contract_id")
             actual_output_amount = self._parse_decimal_like(tx_result.get("output_amount")) or hop.returned_amount
-            # --- Spread loss & slippage calculation ---
-            spread_loss = hop.returned_amount - actual_output_amount
             slippage_pct = hop.slippage
-            if spread_loss > Decimal("0"):
-                await self.monitor.record_spread_loss(
-                    monitor_card,
-                    symbol=hop.buy_symbol,
-                    amount=spread_loss,
-                )
             logger.info(
                 "Tx hop %s/%s berhasil | %s -> %s | tx=%s | output=%s %s | "
-                "expected=%s | spread_loss=%s | slippage=%s%%",
+                "expected=%s | slippage=%s%%",
                 hop_index,
                 len(route.hops),
                 hop.sell_symbol,
@@ -2126,7 +2120,6 @@ class AutoswapBot:
                 actual_output_amount,
                 hop.buy_symbol,
                 hop.returned_amount,
-                spread_loss,
                 slippage_pct,
             )
             await self.monitor.log_event(
@@ -2134,7 +2127,7 @@ class AutoswapBot:
                 (
                     f"✅ Hop {hop_index}/{len(route.hops)} {hop.sell_symbol}->{hop.buy_symbol} "
                     f"tx={tx_identifier or '-'} | "
-                    f"slip={slippage_pct}% spread={spread_loss} {hop.buy_symbol}"
+                    f"out={actual_output_amount} slip={slippage_pct}%"
                 ),
             )
             await self.monitor.log_event(
@@ -2177,6 +2170,12 @@ class AutoswapBot:
                         f"loss={cycle_result.spread_loss}"
                     ),
                 )
+            # Trigger ccview.io fee scrape after each successful hop (non-blocking)
+            self._trigger_fee_scrape_if_available(
+                account_name=account.name,
+                completed_round=round_number,
+                monitor_card=monitor_card,
+            )
             await self._sleep_between_swaps()
         latest_info = await sdk.get_account_info()
         latest_balances = self._balances_by_symbol(latest_info)
@@ -3587,8 +3586,8 @@ class AutoswapBot:
         # Schedule a delayed update to the monitor card with scrape results
         if monitor_card is not None:
             async def _update_card_with_scrape_result() -> None:
-                # Wait a bit for the scrape to complete
-                await asyncio.sleep(8)
+                # Wait for scraper delay (5s) + actual scrape time (~5-10s)
+                await asyncio.sleep(12)
                 result = self.fee_scraper.get_latest_result(account_name)
                 if result is not None and result.success:
                     await self.monitor.update_ccview_fee(
