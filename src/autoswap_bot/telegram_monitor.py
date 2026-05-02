@@ -628,8 +628,8 @@ class TelegramMonitor:
         self._terminal_last_render_monotonic = now
 
     def _dashboard_col_widths(self) -> tuple[int, ...]:
-        # #, Akun, St, CC, USDCx, CBTC, Prog, Plan, Fee, Avg, Gas, Dist, Fund, Fr
-        return (2, 8, 3, 6, 5, 10, 5, 16, 5, 5, 5, 6, 5, 3)
+        # #, Akun, St, CC, USDCx, CBTC, Prog, Plan, Fee, Avg, Gas, AvgF, Dist, Fund, Fr
+        return (2, 8, 3, 6, 5, 10, 5, 16, 5, 5, 8, 5, 6, 5, 3)
 
     def _dashboard_table_lines(self, cards: list[TelegramCardState]) -> tuple[tuple[int, ...], list[str]]:
         col_widths = self._dashboard_col_widths()
@@ -647,6 +647,7 @@ class TelegramMonitor:
                     "Fee",
                     "Avg",
                     "Gas",
+                    "AvgF",
                     "Dist",
                     "Fund",
                     "Fr",
@@ -673,6 +674,7 @@ class TelegramMonitor:
                         self._dashboard_route_fee_compact(card),
                         self._dashboard_fee_avg(card),
                         self._dashboard_gas_compact(card),
+                        self._dashboard_ccview_avg_fee(card),
                         self._dashboard_distributed_compact(card),
                         self._dashboard_funding_compact(card),
                         self._dashboard_free_compact(card),
@@ -814,17 +816,28 @@ class TelegramMonitor:
         return f"{self._fmt_balance(cc_fee, 3)}"
 
     def _dashboard_gas_compact(self, card: TelegramCardState) -> str:
-        """Compact gas fee today — prefer ccview scraper data, fallback to internal."""
-        # Prefer ccview validator fee (scraped from ccview.io, more accurate)
-        ccview_fee = getattr(card, "ccview_validator_fee_total", None)
-        if ccview_fee is not None and ccview_fee > Decimal("0"):
-            return self._fmt_balance(ccview_fee, 2)
-        # Fallback to internal tracking
-        day_fee = self._current_day_network_fee(card)
-        cc_fee = day_fee.get("CC", Decimal("0"))
-        if cc_fee <= 0:
+        """Compact gas fee today — ONLY from ccview scraper data.
+
+        Format: '4.40 (10)' = 4.40 CC total fee, 10 validator tx.
+        Shows '-' if ccview data not yet available.
+        """
+        ccview_fee = card.ccview_validator_fee_total
+        ccview_tx = card.ccview_validator_tx_count
+        if ccview_tx <= 0 or ccview_fee <= Decimal("0"):
             return "-"
-        return self._fmt_balance(cc_fee, 2)
+        fee_text = self._fmt_balance(ccview_fee, 2)
+        return f"{fee_text}({ccview_tx})"
+
+    def _dashboard_ccview_avg_fee(self, card: TelegramCardState) -> str:
+        """Average fee per swap from ccview data.
+
+        Format: '0.44' = rata-rata 0.44 CC per swap.
+        Shows '-' if ccview data not yet available.
+        """
+        avg_fee = card.ccview_avg_fee_per_swap
+        if avg_fee <= Decimal("0"):
+            return "-"
+        return self._fmt_balance(avg_fee, 2)
 
     def _dashboard_free_compact(self, card: TelegramCardState) -> str:
         """Compact free fee display: X/3."""

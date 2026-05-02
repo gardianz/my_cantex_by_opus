@@ -343,6 +343,77 @@ class FeeScraper:
                 exc,
             )
 
+    def trigger_startup_scrape(
+        self,
+        *,
+        party_id: str,
+        account_name: str,
+    ) -> None:
+        """Trigger an immediate scrape at startup (non-blocking, no delay).
+
+        Unlike trigger_background_scrape, this does NOT wait for ccview indexing
+        because we're fetching historical data that's already indexed.
+        """
+        if not party_id:
+            return
+
+        self.log.info(
+            "CCView startup scrape triggered | %s | party_id=%s...",
+            account_name,
+            party_id[:20],
+        )
+
+        task = asyncio.create_task(
+            self._startup_scrape(
+                party_id=party_id,
+                account_name=account_name,
+            )
+        )
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    async def _startup_scrape(
+        self,
+        *,
+        party_id: str,
+        account_name: str,
+    ) -> None:
+        """Startup scrape — no delay, immediate fetch for today's data."""
+        try:
+            today = datetime.now(timezone.utc).date().isoformat()
+            async with self._scrape_lock:
+                result = await self.fetch_actual_fee(party_id, today)
+
+            self._latest_results[account_name] = result
+            self._last_scrape_time[account_name] = time.monotonic()
+
+            if result.success:
+                self.log.info(
+                    "CCView startup scrape OK | %s | date=%s | "
+                    "validator_fee=%s CC (%s tx) | avg=%s CC/swap | swaps=%s",
+                    account_name,
+                    today,
+                    result.validator_fee_total,
+                    result.validator_tx_count,
+                    result.avg_fee_per_swap,
+                    result.swap_tx_count,
+                )
+            else:
+                self.log.warning(
+                    "CCView startup scrape failed | %s | date=%s | error=%s",
+                    account_name,
+                    today,
+                    result.error,
+                )
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            self.log.warning(
+                "CCView startup scrape exception | %s | %s",
+                account_name,
+                exc,
+            )
+
     def start_periodic_scrape(
         self,
         *,

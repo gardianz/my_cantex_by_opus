@@ -213,10 +213,21 @@ class AutoswapBot:
                 # Store party_id for ccview fee scraper
                 if info.address:
                     self._account_party_ids[account.name] = info.address
+                    # Trigger immediate startup scrape (non-blocking)
+                    self.fee_scraper.trigger_startup_scrape(
+                        party_id=info.address,
+                        account_name=account.name,
+                    )
                     # Start periodic background scrape as fallback
                     self.fee_scraper.start_periodic_scrape(
                         party_id=info.address,
                         account_name=account.name,
+                    )
+                    # Schedule delayed card update with startup scrape results
+                    self._schedule_startup_ccview_update(
+                        account_name=account.name,
+                        monitor_card=monitor_card,
+                        logger=logger,
                     )
                 await self.monitor.log_event(
                     monitor_card,
@@ -3575,7 +3586,17 @@ class AutoswapBot:
         """
         party_id = self._account_party_ids.get(account_name, "")
         if not party_id:
+            self.log.debug(
+                "CCView scrape skip: no party_id for %s", account_name
+            )
             return
+
+        self.log.debug(
+            "CCView scrape triggered | %s | round=%s | party_id=%s...",
+            account_name,
+            completed_round,
+            party_id[:20],
+        )
 
         self.fee_scraper.trigger_background_scrape(
             party_id=party_id,
@@ -3590,15 +3611,70 @@ class AutoswapBot:
                 await asyncio.sleep(12)
                 result = self.fee_scraper.get_latest_result(account_name)
                 if result is not None and result.success:
+                    self.log.debug(
+                        "CCView card update | %s | fee=%s | tx=%s | avg=%s",
+                        account_name,
+                        result.validator_fee_total,
+                        result.validator_tx_count,
+                        result.avg_fee_per_swap,
+                    )
                     await self.monitor.update_ccview_fee(
                         monitor_card,
                         validator_fee_total=result.validator_fee_total,
                         validator_tx_count=result.validator_tx_count,
                         avg_fee_per_swap=result.avg_fee_per_swap,
                     )
+                else:
+                    self.log.debug(
+                        "CCView card update skipped | %s | result=%s",
+                        account_name,
+                        "no_result" if result is None else f"failed:{result.error}",
+                    )
 
             task = asyncio.create_task(_update_card_with_scrape_result())
             task.add_done_callback(lambda t: None)  # Suppress unhandled exception
+
+    def _schedule_startup_ccview_update(
+        self,
+        *,
+        account_name: str,
+        monitor_card: TelegramCardState | None,
+        logger: AccountLoggerAdapter,
+    ) -> None:
+        """Schedule a delayed update to monitor card with startup scrape results.
+
+        Waits for the startup scrape to complete (~10-15s) then updates the card.
+        Non-blocking background task.
+        """
+        if monitor_card is None:
+            return
+
+        async def _update_card_after_startup_scrape() -> None:
+            # Wait for startup scrape to complete (no indexing delay, just network)
+            await asyncio.sleep(15)
+            result = self.fee_scraper.get_latest_result(account_name)
+            if result is not None and result.success:
+                logger.info(
+                    "CCView startup data applied to dashboard | "
+                    "fee=%s CC | tx=%s | avg=%s CC/swap",
+                    result.validator_fee_total,
+                    result.validator_tx_count,
+                    result.avg_fee_per_swap,
+                )
+                await self.monitor.update_ccview_fee(
+                    monitor_card,
+                    validator_fee_total=result.validator_fee_total,
+                    validator_tx_count=result.validator_tx_count,
+                    avg_fee_per_swap=result.avg_fee_per_swap,
+                )
+            else:
+                logger.debug(
+                    "CCView startup scrape result not available yet for %s",
+                    account_name,
+                )
+
+        task = asyncio.create_task(_update_card_after_startup_scrape())
+        task.add_done_callback(lambda t: None)  # Suppress unhandled exception
 
     def _merge_amount_maps(
         self,
