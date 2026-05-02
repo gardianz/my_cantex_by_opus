@@ -818,7 +818,12 @@ class TelegramMonitor:
         return f"{self._fmt_balance(cc_fee, 3)}"
 
     def _dashboard_gas_compact(self, card: TelegramCardState) -> str:
-        """Compact gas fee today."""
+        """Compact gas fee today — prefer ccview scraper data, fallback to internal."""
+        # Prefer ccview validator fee (scraped from ccview.io, more accurate)
+        ccview_fee = getattr(card, "ccview_validator_fee_total", None)
+        if ccview_fee is not None and ccview_fee > Decimal("0"):
+            return self._fmt_balance(ccview_fee, 2)
+        # Fallback to internal tracking
         day_fee = self._current_day_network_fee(card)
         cc_fee = day_fee.get("CC", Decimal("0"))
         if cc_fee <= 0:
