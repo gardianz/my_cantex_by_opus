@@ -271,20 +271,11 @@ class AutoswapBot:
                 result.completed_rounds = synced_completed_rounds
                 result.swap_transactions = synced_completed_rounds
 
-                if result.completed_rounds >= prepared_run.rounds and not self._startup_mode_is_refill_cc():
-                    logger.info(
-                        "Target round startup sudah tercapai | progress=%s/%s",
-                        result.completed_rounds,
-                        prepared_run.rounds,
-                    )
-                    await self._wait_until_next_utc_day_after_quota(
-                        sdk=sdk,
-                        account=account,
-                        prepared_run=prepared_run,
-                        result=result,
-                        logger=logger,
-                        monitor_card=monitor_card,
-                    )
+                # Note: quota check moved to after router creation (need router for refill)
+                _startup_quota_reached = (
+                    result.completed_rounds >= prepared_run.rounds
+                    and not self._startup_mode_is_refill_cc()
+                )
 
                 if account.auto_create_intent_account:
                     created = await sdk.ensure_intent_trading_account()
@@ -337,6 +328,35 @@ class AutoswapBot:
                     monitor_card,
                     f"🧭 Startup mode: {self._startup_mode_label()}",
                 )
+
+                # Startup quota check: jika target sudah tercapai, refill dulu baru sleep
+                if _startup_quota_reached:
+                    logger.info(
+                        "Target round startup sudah tercapai | progress=%s/%s | cek balance untuk refill",
+                        result.completed_rounds,
+                        prepared_run.rounds,
+                    )
+                    used_network_fee: defaultdict[str, Decimal] = defaultdict(Decimal)
+                    used_swap_fee: defaultdict[str, Decimal] = defaultdict(Decimal)
+                    # Refill non-CC ke CC sebelum sleep (mematuhi fee cap)
+                    await self._refill_non_cc_to_cc_after_target(
+                        sdk=sdk,
+                        router=router,
+                        account=account,
+                        logger=logger,
+                        monitor_card=monitor_card,
+                        used_network_fee=used_network_fee,
+                        used_swap_fee=used_swap_fee,
+                        result=result,
+                    )
+                    await self._wait_until_next_utc_day_after_quota(
+                        sdk=sdk,
+                        account=account,
+                        prepared_run=prepared_run,
+                        result=result,
+                        logger=logger,
+                        monitor_card=monitor_card,
+                    )
 
                 if self.config.runtime.dry_run:
                     logger.info("Dry-run aktif, tidak ada swap yang dieksekusi")
