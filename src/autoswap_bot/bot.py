@@ -216,6 +216,11 @@ class AutoswapBot:
                 # Store party_id for ccview fee scraper
                 if info.address:
                     self._account_party_ids[account.name] = info.address
+                    logger.info(
+                        "CCView party_id stored | account=%s | party_id=%s",
+                        account.name,
+                        info.address,
+                    )
                     # Trigger immediate startup scrape (non-blocking)
                     self.fee_scraper.trigger_startup_scrape(
                         party_id=info.address,
@@ -231,6 +236,13 @@ class AutoswapBot:
                         account_name=account.name,
                         monitor_card=monitor_card,
                         logger=logger,
+                    )
+                else:
+                    logger.warning(
+                        "CCView party_id KOSONG untuk akun %s — Gas tidak akan ter-update. "
+                        "info.address='%s'",
+                        account.name,
+                        info.address,
                     )
                 await self.monitor.log_event(
                     monitor_card,
@@ -1017,11 +1029,11 @@ class AutoswapBot:
                 strategy_state.strategy_4_min_ticket_consecutive += 1
                 if strategy_state.strategy_4_min_ticket_consecutive >= MAX_CONSECUTIVE_MIN_TICKET_RETRIES:
                     # All foreign pairs are below min ticket size even after topup attempts.
-                    # Force a CC->USDCx topup by clearing blocked pairs and resetting the
-                    # topup guard so the next round will do a fresh CC spend.
+                    # Force a CC->USDCx topup IMMEDIATELY by enabling the topup guard
+                    # so the next round skips recycle and goes straight to CC->USDCx.
                     logger.warning(
                         "MIN_TICKET_SIZE berulang %s kali berturut-turut untuk akun %s, "
-                        "memaksa CC->USDCx top-up baru",
+                        "memaksa CC->USDCx top-up baru SEGERA",
                         strategy_state.strategy_4_min_ticket_consecutive,
                         account.name,
                     )
@@ -1029,14 +1041,15 @@ class AutoswapBot:
                         monitor_card,
                         (
                             f"⚠️ Round {round_number}: MIN_TICKET_SIZE {strategy_state.strategy_4_min_ticket_consecutive}x, "
-                            f"forcing CC top-up"
+                            f"forcing IMMEDIATE CC top-up"
                         ),
                         force=True,
                     )
                     strategy_state.strategy_4_min_ticket_consecutive = 0
                     strategy_state.strategy_4_min_ticket_blocked_pairs.clear()
-                    # Disable the foreign-minimum guard so next round goes straight to CC->USDCx
-                    strategy_state.strategy_4_topup_after_foreign_minimum = False
+                    # Enable the foreign-minimum guard so next round SKIPS recycle
+                    # and goes straight to CC->USDCx topup
+                    strategy_state.strategy_4_topup_after_foreign_minimum = True
                     strategy_state.strategy_4_topup_pending_recycle = False
                     self._reset_balance_block_counter(strategy_state)
                     return RoundExecutionResult(
@@ -2588,6 +2601,105 @@ class AutoswapBot:
                 force=True,
             )
 
+    async def _refill_non_cc_to_cc_after_target(
+        self,
+        *,
+        sdk: ExtendedCantexSDK,
+        router: RouteOptimizer,
+        account: AccountConfig,
+        logger: AccountLoggerAdapter,
+        monitor_card: TelegramCardState | None,
+        used_network_fee: defaultdict[str, Decimal],
+        used_swap_fee: defaultdict[str, Decimal],
+        result: AccountResult,
+    ) -> None:
+        """Refill semua non-CC ke CC setelah target tercapai — untuk SEMUA strategi.
+
+        Ini adalah cleanup step: setelah semua round selesai, kembalikan sisa
+        USDCx/CBTC ke CC agar saldo bersih untuk hari berikutnya.
+        MEMATUHI fee cap — tunggu fee turun sebelum refill.
+        """
+        balances = self._balances_by_symbol(await sdk.get_account_info())
+        remaining = self._non_cc_balances_remaining(balances)
+        if not remaining:
+            logger.debug("Refill after target: tidak ada sisa non-CC untuk di-refill")
+            return
+
+        logger.info(
+            "Refill after target: mengembalikan sisa non-CC ke CC | sisa=%s | strategy=%s",
+            self._format_amount_map(remaining),
+            account.strategy().label,
+        )
+        await self.monitor.log_event(
+            monitor_card,
+            f"🔄 Refill after target: converting {self._format_amount_map(remaining)} back to CC (respecting fee cap)",
+            force=True,
+        )
+        await self.monitor.update_status(
+            monitor_card,
+            phase="PROCESSING",
+            clear_route=True,
+            force=True,
+        )
+
+        total_tx = 0
+        max_iterations = 10  # safety limit (lebih banyak karena mungkin perlu tunggu fee)
+        for iteration in range(max_iterations):
+            self._raise_if_stop_requested()
+            balances = self._balances_by_symbol(await sdk.get_account_info())
+            remaining = self._non_cc_balances_remaining(balances)
+            if not remaining:
+                break
+
+            recovered_tx = await self._recover_to_symbol(
+                sdk=sdk,
+                router=router,
+                target_symbol=CC_SYMBOL,
+                cc_reserve=Decimal("0"),
+                logger=logger,
+                monitor_card=monitor_card,
+                used_network_fee=used_network_fee,
+                used_swap_fee=used_swap_fee,
+            )
+            total_tx += recovered_tx
+            if recovered_tx <= 0:
+                # Fee mungkin terlalu tinggi — tunggu sebentar lalu retry
+                if iteration < max_iterations - 1:
+                    wait_seconds = self._sample_network_fee_poll_seconds()
+                    logger.info(
+                        "Refill after target: fee terlalu tinggi atau gagal, tunggu %.0fs lalu retry | sisa=%s",
+                        wait_seconds,
+                        self._format_amount_map(remaining),
+                    )
+                    await self.monitor.log_event(
+                        monitor_card,
+                        f"⏳ Refill waiting fee drop ({self._format_amount_map(remaining)})",
+                    )
+                    await self._sleep_or_stop(wait_seconds)
+                else:
+                    logger.info(
+                        "Refill after target: max iterations tercapai, sisa: %s",
+                        self._format_amount_map(remaining),
+                    )
+                    await self.monitor.log_event(
+                        monitor_card,
+                        f"⚠️ Refill after target incomplete: sisa {self._format_amount_map(remaining)}",
+                        force=True,
+                    )
+
+        result.swap_transactions += total_tx
+        if total_tx > 0:
+            await self.monitor.log_event(
+                monitor_card,
+                f"✅ Refill after target done: {total_tx} swap(s)",
+                force=True,
+            )
+            await self.monitor.update_balances(
+                monitor_card,
+                self._balances_by_symbol(await sdk.get_account_info()),
+                force=True,
+            )
+
     def _sample_execution_amount(
         self,
         amount_range,
@@ -3748,35 +3860,53 @@ class AutoswapBot:
     ) -> None:
         """Schedule a delayed update to monitor card with startup scrape results.
 
-        Waits for the startup scrape to complete (~10-15s) then updates the card.
+        Waits for the startup scrape to complete then updates the card.
+        Retries up to 3 times with increasing delays if result not ready.
         Non-blocking background task.
         """
         if monitor_card is None:
+            logger.debug("CCView startup update skipped: no monitor_card")
             return
 
         async def _update_card_after_startup_scrape() -> None:
-            # Wait for startup scrape to complete (no indexing delay, just network)
-            await asyncio.sleep(15)
-            result = self.fee_scraper.get_latest_result(account_name)
-            if result is not None and result.success:
-                logger.info(
-                    "CCView startup data applied to dashboard | "
-                    "fee=%s CC | tx=%s | avg=%s CC/swap",
-                    result.validator_fee_total,
-                    result.validator_tx_count,
-                    result.avg_fee_per_swap,
-                )
-                await self.monitor.update_ccview_fee(
-                    monitor_card,
-                    validator_fee_total=result.validator_fee_total,
-                    validator_tx_count=result.validator_tx_count,
-                    avg_fee_per_swap=result.avg_fee_per_swap,
-                )
-            else:
-                logger.debug(
-                    "CCView startup scrape result not available yet for %s",
-                    account_name,
-                )
+            # Retry up to 3 times with increasing delays
+            delays = [15, 30, 60]
+            for attempt, delay in enumerate(delays, start=1):
+                await asyncio.sleep(delay)
+                result = self.fee_scraper.get_latest_result(account_name)
+                if result is not None and result.success:
+                    logger.info(
+                        "CCView startup data applied to dashboard (attempt %s) | "
+                        "fee=%s CC | tx=%s | avg=%s CC/swap",
+                        attempt,
+                        result.validator_fee_total,
+                        result.validator_tx_count,
+                        result.avg_fee_per_swap,
+                    )
+                    await self.monitor.update_ccview_fee(
+                        monitor_card,
+                        validator_fee_total=result.validator_fee_total,
+                        validator_tx_count=result.validator_tx_count,
+                        avg_fee_per_swap=result.avg_fee_per_swap,
+                    )
+                    return  # Success, stop retrying
+                else:
+                    logger.warning(
+                        "CCView startup scrape result not available for %s "
+                        "(attempt %s/%s, waited %ss) | result=%s",
+                        account_name,
+                        attempt,
+                        len(delays),
+                        delay,
+                        "no_result" if result is None else f"error:{result.error}",
+                    )
+            # All retries exhausted
+            logger.warning(
+                "CCView startup scrape GAGAL setelah %s retry untuk %s — "
+                "Gas column akan menunjukkan '-' sampai swap pertama berhasil",
+                len(delays),
+                account_name,
+            )
 
         task = asyncio.create_task(_update_card_after_startup_scrape())
         task.add_done_callback(lambda t: None)  # Suppress unhandled exception
@@ -4078,17 +4208,17 @@ class AutoswapBot:
                 )
                 return
             if result.completed_rounds >= prepared_run.rounds:
-                # Strategy 4: refill semua non-CC ke CC sebelum sleep
-                if account.strategy().key == "strategy_4_reserve":
-                    await self._strategy_4_refill_non_cc_to_cc(
-                        sdk=sdk,
-                        router=router,
-                        logger=logger,
-                        monitor_card=monitor_card,
-                        used_network_fee=used_network_fee,
-                        used_swap_fee=used_swap_fee,
-                        result=result,
-                    )
+                # Refill semua non-CC ke CC sebelum sleep (untuk SEMUA strategi)
+                await self._refill_non_cc_to_cc_after_target(
+                    sdk=sdk,
+                    router=router,
+                    account=account,
+                    logger=logger,
+                    monitor_card=monitor_card,
+                    used_network_fee=used_network_fee,
+                    used_swap_fee=used_swap_fee,
+                    result=result,
+                )
                 await self._wait_until_next_utc_day_after_quota(
                     sdk=sdk,
                     account=account,
@@ -4182,17 +4312,17 @@ class AutoswapBot:
                     )
                     return
                 if result.completed_rounds >= prepared_run.rounds:
-                    # Strategy 4: refill semua non-CC ke CC sebelum sleep
-                    if account.strategy().key == "strategy_4_reserve":
-                        await self._strategy_4_refill_non_cc_to_cc(
-                            sdk=sdk,
-                            router=router,
-                            logger=logger,
-                            monitor_card=monitor_card,
-                            used_network_fee=used_network_fee,
-                            used_swap_fee=used_swap_fee,
-                            result=result,
-                        )
+                    # Refill semua non-CC ke CC sebelum sleep (untuk SEMUA strategi)
+                    await self._refill_non_cc_to_cc_after_target(
+                        sdk=sdk,
+                        router=router,
+                        account=account,
+                        logger=logger,
+                        monitor_card=monitor_card,
+                        used_network_fee=used_network_fee,
+                        used_swap_fee=used_swap_fee,
+                        result=result,
+                    )
                     await self._wait_until_next_utc_day_after_quota(
                         sdk=sdk,
                         account=account,
@@ -4273,6 +4403,17 @@ class AutoswapBot:
                 )
                 return
             if result.completed_rounds >= prepared_run.rounds:
+                # Refill semua non-CC ke CC sebelum sleep (untuk SEMUA strategi)
+                await self._refill_non_cc_to_cc_after_target(
+                    sdk=sdk,
+                    router=router,
+                    account=account,
+                    logger=logger,
+                    monitor_card=monitor_card,
+                    used_network_fee=used_network_fee,
+                    used_swap_fee=used_swap_fee,
+                    result=result,
+                )
                 await self._wait_until_next_utc_day_after_quota(
                     sdk=sdk,
                     account=account,
@@ -4370,6 +4511,17 @@ class AutoswapBot:
                     )
                     return
                 if result.completed_rounds >= prepared_run.rounds:
+                    # Refill semua non-CC ke CC sebelum sleep (untuk SEMUA strategi)
+                    await self._refill_non_cc_to_cc_after_target(
+                        sdk=sdk,
+                        router=router,
+                        account=account,
+                        logger=logger,
+                        monitor_card=monitor_card,
+                        used_network_fee=used_network_fee,
+                        used_swap_fee=used_swap_fee,
+                        result=result,
+                    )
                     await self._wait_until_next_utc_day_after_quota(
                         sdk=sdk,
                         account=account,

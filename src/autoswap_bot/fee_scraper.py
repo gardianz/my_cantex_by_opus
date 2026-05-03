@@ -143,6 +143,12 @@ class FeeScraper:
         try:
             client = await self._ensure_client()
 
+            self.log.debug(
+                "CCView fetch_actual_fee | party_id=%s | date=%s",
+                party_id[:30] if party_id else "(empty)",
+                date,
+            )
+
             # Fetch counterparties
             params = {
                 "party_id": party_id,
@@ -154,7 +160,12 @@ class FeeScraper:
 
             cp_data = await self._fetch_with_retry(client, COUNTERPARTIES_URL, params)
             if cp_data is None:
-                result.error = "Failed to fetch counterparties"
+                result.error = f"Failed to fetch counterparties (party_id={party_id[:30]})"
+                self.log.warning(
+                    "CCView counterparties returned None | party_id=%s | date=%s",
+                    party_id[:30] if party_id else "(empty)",
+                    date,
+                )
                 return result
 
             # Parse counterparties and find validator
@@ -355,6 +366,10 @@ class FeeScraper:
         because we're fetching historical data that's already indexed.
         """
         if not party_id:
+            self.log.warning(
+                "CCView trigger_startup_scrape SKIPPED: party_id kosong untuk %s",
+                account_name,
+            )
             return
 
         self.log.info(
