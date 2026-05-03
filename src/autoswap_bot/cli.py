@@ -13,13 +13,19 @@ from .config import load_config
 from .env_loader import load_dotenv_file
 
 
+STRATEGY_CHOICES = {
+    "1": "strategy_1",
+    "2": "strategy_2",
+    "3": "strategy_3_cycle",
+    "4": "strategy_4_reserve",
+}
+
 STARTUP_MODE_CHOICES = {
-    "1": "free_only",
-    "2": "free_then_swap",
-    "3": "swap_only",
-    "4": "planned_fee",
-    "5": "estimate_cc",
-    "6": "refill_cc",
+    "1": "swap_only",
+    "2": "free_only",
+    "3": "free_then_swap",
+    "4": "swap_only",
+    "5": "refill_cc",
 }
 
 
@@ -27,23 +33,46 @@ def _default_startup_mode() -> str:
     return "free_then_swap"
 
 
+def _prompt_strategy() -> str | None:
+    """Prompt user to select a strategy. Returns strategy key or None to use config default."""
+    if not sys.stdin.isatty():
+        return None
+
+    print("\nPilih strategi:", flush=True)
+    print("1. Strategi 1: CC → USDCx", flush=True)
+    print("2. Strategi 2: CC → CBTC", flush=True)
+    print("3. Strategi 3: CC → USDCx → CBTC (Cycle)", flush=True)
+    print("4. Strategi 4: CC → USDCx → CBTC (Reserve)", flush=True)
+    print("0. Gunakan strategi dari config (default)", flush=True)
+
+    while True:
+        print("Masukkan pilihan (0/1/2/3/4): ", end="", flush=True)
+        try:
+            answer = input().strip()
+        except EOFError:
+            print("", flush=True)
+            return None
+        if answer == "0" or answer == "":
+            return None
+        strategy = STRATEGY_CHOICES.get(answer)
+        if strategy is not None:
+            return strategy
+        print("Pilihan tidak valid.", flush=True)
+
+
 def _prompt_startup_mode() -> str:
     if not sys.stdin.isatty():
         return _default_startup_mode()
 
-    print("Pilih mode bot:", flush=True)
-    print("1. Mode hanya ambil free swap", flush=True)
-    print(
-        "2. Mode ambil free swap lalu lanjut swap sesuai batas swap dan fee swap yang ditentukan",
-        flush=True,
-    )
-    print("3. Mode swap sesuai batas swap dan fee swap yang ditentukan", flush=True)
-    print("4. Mode swap sesuai jam plan dan batas fee yang ditentukan", flush=True)
-    print("5. Mode hitung estimasi kebutuhan CC dari config saat ini", flush=True)
-    print("6. Mode refill semua token selain CC ke CC lalu berhenti", flush=True)
+    print("\nPilih mode bot:", flush=True)
+    print("1. Mode swap langsung (direct)", flush=True)
+    print("2. Mode free swap only", flush=True)
+    print("3. Mode free lalu swap", flush=True)
+    print("4. Mode swap only", flush=True)
+    print("5. Mode refill semua token ke CC lalu berhenti", flush=True)
 
     while True:
-        print("Masukkan pilihan (1/2/3/4/5/6): ", end="", flush=True)
+        print("Masukkan pilihan (1/2/3/4/5): ", end="", flush=True)
         try:
             answer = input().strip()
         except EOFError:
@@ -53,6 +82,7 @@ def _prompt_startup_mode() -> str:
         if startup_mode is not None:
             return startup_mode
         print("Pilihan tidak valid.", flush=True)
+
 
 class InterruptController:
     def __init__(self) -> None:
@@ -107,17 +137,44 @@ def build_parser() -> argparse.ArgumentParser:
         default="config/accounts.toml",
         help="Path ke file konfigurasi TOML",
     )
+    parser.add_argument(
+        "--strategy",
+        default=None,
+        choices=["1", "2", "3", "4"],
+        help="Override strategi (1-4). Jika tidak diset, akan ditanya interaktif.",
+    )
+    parser.add_argument(
+        "--mode",
+        default=None,
+        choices=["swap_only", "free_only", "free_then_swap", "refill_cc"],
+        help="Override startup mode. Jika tidak diset, akan ditanya interaktif.",
+    )
     return parser
 
 
-async def _run(config_path: str, interrupt_controller: InterruptController) -> int:
+async def _run(config_path: str, interrupt_controller: InterruptController, *, cli_strategy: str | None = None, cli_mode: str | None = None) -> int:
     repo_root = Path(__file__).resolve().parents[2]
     load_dotenv_file(repo_root / ".env")
     config = load_config(config_path)
-    startup_mode = _prompt_startup_mode()
+
+    # Strategy selection
+    selected_strategy = cli_strategy
+    if selected_strategy is None:
+        selected_strategy = _prompt_strategy()
+    # Apply strategy override to all accounts if selected
+    if selected_strategy is not None:
+        for account in config.accounts:
+            object.__setattr__(account, "strategy_name", selected_strategy)
+
+    # Mode selection
+    startup_mode = cli_mode
+    if startup_mode is None:
+        startup_mode = _prompt_startup_mode()
+
     if startup_mode == "estimate_cc":
         print(render_required_cc_report(config), flush=True)
         return 0
+
     configure_logging(
         config.runtime.log_level,
         use_utc=True,
@@ -132,6 +189,14 @@ async def _run(config_path: str, interrupt_controller: InterruptController) -> i
 
 def main() -> int:
     args = build_parser().parse_args()
+
+    # Resolve CLI overrides
+    cli_strategy: str | None = None
+    if args.strategy is not None:
+        cli_strategy = STRATEGY_CHOICES.get(args.strategy)
+
+    cli_mode: str | None = args.mode
+
     interrupt_controller = InterruptController()
     loop = asyncio.new_event_loop()
     interrupt_controller.attach_loop(loop)
@@ -139,7 +204,7 @@ def main() -> int:
     signal.signal(signal.SIGINT, lambda *_: interrupt_controller.handle_sigint())
     try:
         asyncio.set_event_loop(loop)
-        return loop.run_until_complete(_run(args.config, interrupt_controller))
+        return loop.run_until_complete(_run(args.config, interrupt_controller, cli_strategy=cli_strategy, cli_mode=cli_mode))
     finally:
         signal.signal(signal.SIGINT, previous_sigint)
         pending = [task for task in asyncio.all_tasks(loop) if not task.done()]

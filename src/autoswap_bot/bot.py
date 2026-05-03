@@ -9,7 +9,7 @@ import sys
 import time
 from collections import defaultdict
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -60,6 +60,8 @@ class StrategyRuntimeState:
     consecutive_balance_blocked_rounds: int = 0
     strategy_4_topup_pending_recycle: bool = False
     strategy_4_topup_after_foreign_minimum: bool = False
+    strategy_4_min_ticket_consecutive: int = 0
+    strategy_4_min_ticket_blocked_pairs: set = field(default_factory=set)
 
 
 @dataclass(frozen=True)
@@ -83,6 +85,7 @@ class RoundExecutionResult:
 
 
 MAX_CONSECUTIVE_BALANCE_BLOCKED_ROUNDS = 5
+MAX_CONSECUTIVE_MIN_TICKET_RETRIES = 3
 
 
 class AutoswapBot:
@@ -256,7 +259,7 @@ class AutoswapBot:
                 result.completed_rounds = synced_completed_rounds
                 result.swap_transactions = synced_completed_rounds
 
-                if result.completed_rounds >= prepared_run.rounds:
+                if result.completed_rounds >= prepared_run.rounds and not self._startup_mode_is_refill_cc():
                     logger.info(
                         "Target round startup sudah tercapai | progress=%s/%s",
                         result.completed_rounds,
@@ -965,6 +968,9 @@ class AutoswapBot:
     ) -> None:
         if account.strategy().key != "strategy_4_reserve":
             return
+        # Reset MIN_TICKET_SIZE consecutive counter on any successful swap
+        strategy_state.strategy_4_min_ticket_consecutive = 0
+        strategy_state.strategy_4_min_ticket_blocked_pairs.clear()
         if action.sell_symbol == CC_SYMBOL and action.buy_symbol == "USDCx":
             strategy_state.strategy_4_topup_pending_recycle = True
             strategy_state.strategy_4_topup_after_foreign_minimum = False
@@ -1006,6 +1012,42 @@ class AutoswapBot:
             )
 
         if self._strategy_4_has_cc_topup_capacity(account=account, monitor_card=monitor_card):
+            # Track consecutive MIN_TICKET_SIZE failures to prevent infinite retry loop
+            if stop_reason == "MIN_TICKET_SIZE":
+                strategy_state.strategy_4_min_ticket_consecutive += 1
+                if strategy_state.strategy_4_min_ticket_consecutive >= MAX_CONSECUTIVE_MIN_TICKET_RETRIES:
+                    # All foreign pairs are below min ticket size even after topup attempts.
+                    # Force a CC->USDCx topup by clearing blocked pairs and resetting the
+                    # topup guard so the next round will do a fresh CC spend.
+                    logger.warning(
+                        "MIN_TICKET_SIZE berulang %s kali berturut-turut untuk akun %s, "
+                        "memaksa CC->USDCx top-up baru",
+                        strategy_state.strategy_4_min_ticket_consecutive,
+                        account.name,
+                    )
+                    await self.monitor.log_event(
+                        monitor_card,
+                        (
+                            f"⚠️ Round {round_number}: MIN_TICKET_SIZE {strategy_state.strategy_4_min_ticket_consecutive}x, "
+                            f"forcing CC top-up"
+                        ),
+                        force=True,
+                    )
+                    strategy_state.strategy_4_min_ticket_consecutive = 0
+                    strategy_state.strategy_4_min_ticket_blocked_pairs.clear()
+                    # Disable the foreign-minimum guard so next round goes straight to CC->USDCx
+                    strategy_state.strategy_4_topup_after_foreign_minimum = False
+                    strategy_state.strategy_4_topup_pending_recycle = False
+                    self._reset_balance_block_counter(strategy_state)
+                    return RoundExecutionResult(
+                        completed=False,
+                        tx_count=tx_count,
+                        stop_reason=stop_reason,
+                        skipped=True,
+                    )
+            else:
+                strategy_state.strategy_4_min_ticket_consecutive = 0
+
             self._reset_balance_block_counter(strategy_state)
             strategy_state.strategy_4_topup_after_foreign_minimum = True
             logger.info(
@@ -2480,6 +2522,69 @@ class AutoswapBot:
             await self.monitor.log_event(
                 monitor_card,
                 f"✅ Weekly refill complete: {total_tx} refill swap(s)",
+                force=True,
+            )
+
+    async def _strategy_4_refill_non_cc_to_cc(
+        self,
+        *,
+        sdk: ExtendedCantexSDK,
+        router: RouteOptimizer,
+        logger: AccountLoggerAdapter,
+        monitor_card: TelegramCardState | None,
+        used_network_fee: defaultdict[str, Decimal],
+        used_swap_fee: defaultdict[str, Decimal],
+        result: AccountResult,
+    ) -> None:
+        """Strategy 4: refill semua USDCx dan CBTC kembali ke CC setelah target tercapai."""
+        logger.info("Strategy 4 refill: mengembalikan semua non-CC ke CC setelah quota tercapai")
+        await self.monitor.log_event(
+            monitor_card,
+            "🔄 Strategy 4 refill: converting non-CC back to CC",
+            force=True,
+        )
+
+        total_tx = 0
+        max_iterations = 5  # safety limit
+        for _ in range(max_iterations):
+            balances = self._balances_by_symbol(await sdk.get_account_info())
+            remaining = self._non_cc_balances_remaining(balances)
+            if not remaining:
+                break
+
+            recovered_tx = await self._recover_to_symbol(
+                sdk=sdk,
+                router=router,
+                target_symbol=CC_SYMBOL,
+                cc_reserve=Decimal("0"),
+                logger=logger,
+                monitor_card=monitor_card,
+                used_network_fee=used_network_fee,
+                used_swap_fee=used_swap_fee,
+            )
+            total_tx += recovered_tx
+            if recovered_tx <= 0:
+                logger.info(
+                    "Strategy 4 refill: tidak bisa mengosongkan sisa token non-CC: %s",
+                    self._format_amount_map(remaining),
+                )
+                await self.monitor.log_event(
+                    monitor_card,
+                    f"⚠️ Strategy 4 refill incomplete: sisa {self._format_amount_map(remaining)}",
+                    force=True,
+                )
+                break
+
+        result.swap_transactions += total_tx
+        if total_tx > 0:
+            await self.monitor.log_event(
+                monitor_card,
+                f"✅ Strategy 4 refill done: {total_tx} swap(s)",
+                force=True,
+            )
+            await self.monitor.update_balances(
+                monitor_card,
+                self._balances_by_symbol(await sdk.get_account_info()),
                 force=True,
             )
 
@@ -3973,6 +4078,17 @@ class AutoswapBot:
                 )
                 return
             if result.completed_rounds >= prepared_run.rounds:
+                # Strategy 4: refill semua non-CC ke CC sebelum sleep
+                if account.strategy().key == "strategy_4_reserve":
+                    await self._strategy_4_refill_non_cc_to_cc(
+                        sdk=sdk,
+                        router=router,
+                        logger=logger,
+                        monitor_card=monitor_card,
+                        used_network_fee=used_network_fee,
+                        used_swap_fee=used_swap_fee,
+                        result=result,
+                    )
                 await self._wait_until_next_utc_day_after_quota(
                     sdk=sdk,
                     account=account,
@@ -4066,6 +4182,17 @@ class AutoswapBot:
                     )
                     return
                 if result.completed_rounds >= prepared_run.rounds:
+                    # Strategy 4: refill semua non-CC ke CC sebelum sleep
+                    if account.strategy().key == "strategy_4_reserve":
+                        await self._strategy_4_refill_non_cc_to_cc(
+                            sdk=sdk,
+                            router=router,
+                            logger=logger,
+                            monitor_card=monitor_card,
+                            used_network_fee=used_network_fee,
+                            used_swap_fee=used_swap_fee,
+                            result=result,
+                        )
                     await self._wait_until_next_utc_day_after_quota(
                         sdk=sdk,
                         account=account,
