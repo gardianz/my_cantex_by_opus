@@ -862,6 +862,11 @@ class AutoswapBot:
             if recycle_candidates:
                 return recycle_candidates, "strategy_4 recycle phase"
 
+        # Jika topup_after_foreign_minimum aktif, HAPUS recycle candidates
+        # agar bot langsung ke CC→USDCx topup (tidak retry pair yang kena MIN_TICKET_SIZE)
+        if strategy_state.strategy_4_topup_after_foreign_minimum:
+            recycle_candidates = []
+
         spendable_cc = self._spendable_amount(
             CC_SYMBOL,
             cc_balance,
