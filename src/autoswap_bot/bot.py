@@ -1017,12 +1017,23 @@ class AutoswapBot:
             strategy_state.strategy_4_topup_after_foreign_minimum = False
 
     def _is_balance_blocking_stop_reason(self, stop_reason: str | None) -> bool:
+        """Check if stop reason indicates a genuine balance shortage.
+
+        NOTE: MIN_TICKET_SIZE is NOT included here because it indicates a
+        routing/pair-size issue, not an actual balance shortage. An account
+        can have sufficient CC and USDCx but still hit MIN_TICKET_SIZE when
+        the routed equivalent is below protocol minimum. Including it here
+        caused false-positive INSUFFICIENT_BALANCE stops.
+        """
         return stop_reason in {
             "WAIT_SOURCE_BALANCE",
-            "MIN_TICKET_SIZE",
             "SERVER_INSUFFICIENT_BALANCE",
             "USER_CONFIG_MIN_NOT_MET",
         }
+
+    def _is_min_ticket_stop_reason(self, stop_reason: str | None) -> bool:
+        """Check if stop reason is MIN_TICKET_SIZE (routing issue, not balance)."""
+        return stop_reason == "MIN_TICKET_SIZE"
 
     def _reset_balance_block_counter(self, strategy_state: StrategyRuntimeState) -> None:
         strategy_state.consecutive_balance_blocked_rounds = 0
@@ -1038,19 +1049,16 @@ class AutoswapBot:
         logger: AccountLoggerAdapter,
         monitor_card: TelegramCardState | None,
     ) -> RoundExecutionResult:
-        if not self._is_balance_blocking_stop_reason(stop_reason):
+        # --- MIN_TICKET_SIZE: routing/pair-size issue, NOT a balance shortage ---
+        # This must NEVER increment consecutive_balance_blocked_rounds because
+        # the account may have plenty of CC/USDCx but the routed equivalent
+        # for a specific pair is below protocol minimum.
+        if self._is_min_ticket_stop_reason(stop_reason):
+            # Always reset the balance block counter — this is not a balance issue
             self._reset_balance_block_counter(strategy_state)
-            strategy_state.strategy_4_topup_after_foreign_minimum = False
-            return RoundExecutionResult(
-                completed=False,
-                tx_count=tx_count,
-                stop_reason=stop_reason,
-                skipped=True,
-            )
 
-        if self._strategy_4_has_cc_topup_capacity(account=account, monitor_card=monitor_card):
-            # Track consecutive MIN_TICKET_SIZE failures to prevent infinite retry loop
-            if stop_reason == "MIN_TICKET_SIZE":
+            if self._strategy_4_has_cc_topup_capacity(account=account, monitor_card=monitor_card):
+                # Track consecutive MIN_TICKET_SIZE failures to prevent infinite retry loop
                 strategy_state.strategy_4_min_ticket_consecutive += 1
                 if strategy_state.strategy_4_min_ticket_consecutive >= MAX_CONSECUTIVE_MIN_TICKET_RETRIES:
                     # All foreign pairs are below min ticket size even after topup attempts.
@@ -1076,16 +1084,57 @@ class AutoswapBot:
                     # and goes straight to CC->USDCx topup
                     strategy_state.strategy_4_topup_after_foreign_minimum = True
                     strategy_state.strategy_4_topup_pending_recycle = False
-                    self._reset_balance_block_counter(strategy_state)
                     return RoundExecutionResult(
                         completed=False,
                         tx_count=tx_count,
                         stop_reason=stop_reason,
                         skipped=True,
                     )
-            else:
-                strategy_state.strategy_4_min_ticket_consecutive = 0
 
+                # Still have topup capacity, enable topup guard for next round
+                strategy_state.strategy_4_topup_after_foreign_minimum = True
+                logger.info(
+                    "MIN_TICKET_SIZE untuk akun %s (bukan saldo kurang) — CC masih cukup untuk top-up, lanjut retry",
+                    account.name,
+                )
+                await self.monitor.log_event(
+                    monitor_card,
+                    f"ℹ️ Round {round_number}: MIN_TICKET_SIZE (routing issue, bukan saldo kurang), retry",
+                )
+                return RoundExecutionResult(
+                    completed=False,
+                    tx_count=tx_count,
+                    stop_reason=stop_reason,
+                    skipped=True,
+                )
+
+            # No topup capacity but still NOT a balance block — just skip
+            logger.info(
+                "MIN_TICKET_SIZE untuk akun %s tanpa topup capacity — skip tanpa naikkan balance counter",
+                account.name,
+            )
+            strategy_state.strategy_4_min_ticket_consecutive = 0
+            return RoundExecutionResult(
+                completed=False,
+                tx_count=tx_count,
+                stop_reason=stop_reason,
+                skipped=True,
+            )
+
+        # --- Non-balance-blocking reasons (e.g. FEE_TOO_HIGH, ROUTE_ERROR) ---
+        if not self._is_balance_blocking_stop_reason(stop_reason):
+            self._reset_balance_block_counter(strategy_state)
+            strategy_state.strategy_4_topup_after_foreign_minimum = False
+            return RoundExecutionResult(
+                completed=False,
+                tx_count=tx_count,
+                stop_reason=stop_reason,
+                skipped=True,
+            )
+
+        # --- Genuine balance-blocking reasons ---
+        if self._strategy_4_has_cc_topup_capacity(account=account, monitor_card=monitor_card):
+            strategy_state.strategy_4_min_ticket_consecutive = 0
             self._reset_balance_block_counter(strategy_state)
             strategy_state.strategy_4_topup_after_foreign_minimum = True
             logger.info(
@@ -3840,12 +3889,15 @@ class AutoswapBot:
         """
         party_id = self._account_party_ids.get(account_name, "")
         if not party_id:
-            self.log.debug(
-                "CCView scrape skip: no party_id for %s", account_name
+            self.log.warning(
+                "CCView scrape SKIP: no party_id stored for %s "
+                "(stored_ids=%s)",
+                account_name,
+                list(self._account_party_ids.keys()),
             )
             return
 
-        self.log.debug(
+        self.log.info(
             "CCView scrape triggered | %s | round=%s | party_id=%s...",
             account_name,
             completed_round,
@@ -3861,12 +3913,13 @@ class AutoswapBot:
         # Schedule a delayed update to the monitor card with scrape results
         if monitor_card is not None:
             async def _update_card_with_scrape_result() -> None:
-                # Wait for scraper delay (5s) + actual scrape time (~5-10s)
-                await asyncio.sleep(12)
+                # Wait for scraper delay (5s) + actual scrape time (~3-5s)
+                # Reduced from 12s to 8s for faster card updates
+                await asyncio.sleep(8)
                 result = self.fee_scraper.get_latest_result(account_name)
                 if result is not None and result.success:
-                    self.log.debug(
-                        "CCView card update | %s | fee=%s | tx=%s | avg=%s",
+                    self.log.info(
+                        "CCView card update OK | %s | fee=%s | tx=%s | avg=%s",
                         account_name,
                         result.validator_fee_total,
                         result.validator_tx_count,
@@ -3878,15 +3931,55 @@ class AutoswapBot:
                         validator_tx_count=result.validator_tx_count,
                         avg_fee_per_swap=result.avg_fee_per_swap,
                     )
-                else:
-                    self.log.debug(
-                        "CCView card update skipped | %s | result=%s",
+                elif result is None:
+                    # Result not ready yet — retry once after 5s more
+                    self.log.info(
+                        "CCView card update: result not ready yet for %s, retrying in 5s...",
                         account_name,
-                        "no_result" if result is None else f"failed:{result.error}",
+                    )
+                    await asyncio.sleep(5)
+                    result = self.fee_scraper.get_latest_result(account_name)
+                    if result is not None and result.success:
+                        self.log.info(
+                            "CCView card update OK (retry) | %s | fee=%s | tx=%s | avg=%s",
+                            account_name,
+                            result.validator_fee_total,
+                            result.validator_tx_count,
+                            result.avg_fee_per_swap,
+                        )
+                        await self.monitor.update_ccview_fee(
+                            monitor_card,
+                            validator_fee_total=result.validator_fee_total,
+                            validator_tx_count=result.validator_tx_count,
+                            avg_fee_per_swap=result.avg_fee_per_swap,
+                        )
+                    else:
+                        self.log.warning(
+                            "CCView card update FAILED after retry | %s | result=%s",
+                            account_name,
+                            "no_result" if result is None else f"error:{result.error}",
+                        )
+                else:
+                    self.log.warning(
+                        "CCView card update skipped | %s | scrape_error=%s",
+                        account_name,
+                        result.error,
                     )
 
             task = asyncio.create_task(_update_card_with_scrape_result())
-            task.add_done_callback(lambda t: None)  # Suppress unhandled exception
+
+            def _log_card_update_failure(t: asyncio.Task) -> None:
+                if t.cancelled():
+                    return
+                exc = t.exception()
+                if exc is not None:
+                    self.log.warning(
+                        "CCView card update task exception | %s | %s",
+                        account_name,
+                        exc,
+                    )
+
+            task.add_done_callback(_log_card_update_failure)
 
     def _schedule_startup_ccview_update(
         self,

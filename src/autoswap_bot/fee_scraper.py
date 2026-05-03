@@ -34,8 +34,8 @@ VALIDATOR_PATTERNS = ("cantex-validator", "Cantex-validator")
 MIN_SCRAPE_COOLDOWN_SECONDS = 5.0
 # Delay before scraping after a swap (ccview.io needs time to index)
 SCRAPE_DELAY_AFTER_SWAP_SECONDS = 5.0
-# Periodic scrape interval (fallback) in seconds
-PERIODIC_SCRAPE_INTERVAL_SECONDS = 120.0
+# Periodic scrape interval (fallback) in seconds — reduced from 120s for faster updates
+PERIODIC_SCRAPE_INTERVAL_SECONDS = 90.0
 
 
 @dataclass
@@ -461,6 +461,12 @@ class FeeScraper:
         account_name: str,
     ) -> None:
         """Periodic scrape loop — runs until cancelled."""
+        self.log.info(
+            "CCView periodic scrape loop started | %s | interval=%ss | party_id=%s...",
+            account_name,
+            PERIODIC_SCRAPE_INTERVAL_SECONDS,
+            party_id[:20],
+        )
         try:
             while True:
                 await asyncio.sleep(PERIODIC_SCRAPE_INTERVAL_SECONDS)
@@ -471,21 +477,28 @@ class FeeScraper:
                     if result.success:
                         self._latest_results[account_name] = result
                         self._last_scrape_time[account_name] = time.monotonic()
-                        self.log.debug(
+                        self.log.info(
                             "CCView periodic scrape OK | %s | "
-                            "validator_fee=%s CC (%s tx)",
+                            "validator_fee=%s CC (%s tx) | avg=%s CC/swap",
                             account_name,
                             result.validator_fee_total,
                             result.validator_tx_count,
+                            result.avg_fee_per_swap,
+                        )
+                    else:
+                        self.log.warning(
+                            "CCView periodic scrape failed | %s | error=%s",
+                            account_name,
+                            result.error,
                         )
                 except Exception as exc:
-                    self.log.debug(
+                    self.log.warning(
                         "CCView periodic scrape error | %s | %s",
                         account_name,
                         exc,
                     )
         except asyncio.CancelledError:
-            pass
+            self.log.debug("CCView periodic scrape loop cancelled | %s", account_name)
 
     def get_latest_result(self, account_name: str) -> ActualFeeResult | None:
         """Get the latest scrape result for an account."""

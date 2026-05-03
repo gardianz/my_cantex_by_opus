@@ -632,3 +632,28 @@ Arti pilihan:
 ### Account nonaktif tetap minta private key
 
 Account dengan `enabled = false` akan di-skip. Jika masih error, cek apakah field account aktif dan nonaktif tertukar saat mengedit config.
+
+### False positive "saldo kurang" karena MIN_TICKET_SIZE
+
+Sebelumnya, `MIN_TICKET_SIZE` dianggap sebagai indikator "saldo kurang" dan menaikkan counter `consecutive_balance_blocked_rounds`. Setelah 5x berturut-turut, bot menghentikan account dengan status `INSUFFICIENT_BALANCE`.
+
+Ini adalah **false positive** karena:
+- `MIN_TICKET_SIZE` berarti pair yang di-route memiliki equivalent CC di bawah minimum protocol (misal < 10 CC)
+- Bukan berarti saldo account kurang — account bisa punya CC=14 dan USDCx=17 tapi tetap kena MIN_TICKET_SIZE untuk pair tertentu
+- Ini masalah routing/pair-size, bukan masalah balance
+
+**Fix**: `MIN_TICKET_SIZE` sekarang ditangani secara terpisah dan **tidak pernah** menaikkan `consecutive_balance_blocked_rounds`. Bot tetap retry dengan topup guard tanpa risiko false-positive stop.
+
+### Gas fee dari ccview tidak update setelah swap
+
+Jika gas fee di monitor Telegram tidak update setelah swap berhasil, kemungkinan penyebab:
+
+1. `party_id` tidak tersimpan — cek log `CCView party_id stored` saat startup
+2. Scrape berhasil tapi card update gagal — cek log `CCView card update`
+3. Cooldown terlalu ketat — minimum 5 detik antar scrape per account
+
+**Perbaikan yang diterapkan**:
+- Logging ditingkatkan dari DEBUG ke INFO/WARNING agar mudah di-trace
+- Delay card update dikurangi dari 12s ke 8s dengan retry otomatis jika result belum ready
+- Periodic scrape interval dikurangi dari 120s ke 90s
+- Exception di background task tidak lagi di-swallow — akan muncul di log sebagai WARNING
