@@ -24,8 +24,7 @@ STARTUP_MODE_CHOICES = {
     "1": "swap_only",
     "2": "free_only",
     "3": "free_then_swap",
-    "4": "swap_only",
-    "5": "refill_cc",
+    "4": "refill_cc",
 }
 
 
@@ -68,11 +67,10 @@ def _prompt_startup_mode() -> str:
     print("1. Mode swap langsung (direct)", flush=True)
     print("2. Mode free swap only", flush=True)
     print("3. Mode free lalu swap", flush=True)
-    print("4. Mode swap only", flush=True)
-    print("5. Mode refill semua token ke CC lalu berhenti", flush=True)
+    print("4. Mode refill semua token ke CC lalu berhenti", flush=True)
 
     while True:
-        print("Masukkan pilihan (1/2/3/4/5): ", end="", flush=True)
+        print("Masukkan pilihan (1/2/3/4): ", end="", flush=True)
         try:
             answer = input().strip()
         except EOFError:
