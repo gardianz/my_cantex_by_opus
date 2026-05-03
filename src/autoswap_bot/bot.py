@@ -2708,15 +2708,27 @@ class AutoswapBot:
                     )
 
         result.swap_transactions += total_tx
-        if total_tx > 0:
+
+        # Final balance check — pastikan refill berhasil sebelum NEXT-DAY
+        final_balances = self._balances_by_symbol(await sdk.get_account_info())
+        final_remaining = self._non_cc_balances_remaining(final_balances)
+        await self.monitor.update_balances(monitor_card, final_balances, force=True)
+
+        if final_remaining:
+            logger.warning(
+                "Refill after target: MASIH ADA sisa non-CC setelah refill: %s",
+                self._format_amount_map(final_remaining),
+            )
             await self.monitor.log_event(
                 monitor_card,
-                f"✅ Refill after target done: {total_tx} swap(s)",
+                f"⚠️ Refill incomplete — sisa: {self._format_amount_map(final_remaining)}",
                 force=True,
             )
-            await self.monitor.update_balances(
+        else:
+            logger.info("Refill after target: ✅ semua non-CC berhasil di-refill ke CC")
+            await self.monitor.log_event(
                 monitor_card,
-                self._balances_by_symbol(await sdk.get_account_info()),
+                f"✅ Refill complete: {total_tx} swap(s) | CC={final_balances.get(CC_SYMBOL, Decimal('0'))}",
                 force=True,
             )
 
