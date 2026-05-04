@@ -121,6 +121,7 @@ class AccountResult:
         normal_stop_reasons = {
             "WEEKLY_STOP",
             "WEEKLY_REFILL_COMPLETE",
+            "CHECK_ACCOUNTS_COMPLETE",
         }
         return (
             self.error is None

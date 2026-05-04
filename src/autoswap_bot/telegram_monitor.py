@@ -628,8 +628,8 @@ class TelegramMonitor:
         self._terminal_last_render_monotonic = now
 
     def _dashboard_col_widths(self) -> tuple[int, ...]:
-        # #, Akun, St, CC, USDCx, CBTC, Prog, Plan, Fee, Avg, Gas, AvgF, CyLoss, Dist, Fund, Fr
-        return (2, 8, 3, 6, 5, 10, 5, 16, 5, 5, 8, 5, 10, 6, 5, 3)
+        # #, Akun, St, CC, USDCx, CBTC, Prog, Plan, Fee, Avg, Gas, AvgF, Rew, CyLoss, Dist, Fund, Fr
+        return (2, 8, 3, 6, 5, 10, 5, 16, 5, 5, 8, 5, 6, 10, 6, 5, 3)
 
     def _dashboard_table_lines(self, cards: list[TelegramCardState]) -> tuple[tuple[int, ...], list[str]]:
         col_widths = self._dashboard_col_widths()
@@ -648,6 +648,7 @@ class TelegramMonitor:
                     "Avg",
                     "Gas",
                     "AvgF",
+                    "Rew",
                     "CyLoss",
                     "Dist",
                     "Fund",
@@ -676,6 +677,7 @@ class TelegramMonitor:
                         self._dashboard_fee_avg(card),
                         self._dashboard_gas_compact(card),
                         self._dashboard_ccview_avg_fee(card),
+                        self._dashboard_reward_yesterday_compact(card),
                         self._format_cycle_spread_loss_compact(card),
                         self._dashboard_distributed_compact(card),
                         self._dashboard_funding_compact(card),
@@ -840,6 +842,24 @@ class TelegramMonitor:
         if avg_fee <= Decimal("0"):
             return "-"
         return self._fmt_balance(avg_fee, 2)
+
+    def _dashboard_reward_yesterday_compact(self, card: TelegramCardState) -> str:
+        """Compact reward yesterday: just the number (no ' CC' suffix)."""
+        summary = card.activity_summary
+        if summary is None:
+            return "-"
+        raw = summary.rebates.get("yesterday")
+        if raw in {None, ""}:
+            return "-"
+        rendered = self._rebate_amount_compact(raw)
+        if rendered == "-":
+            return "-"
+        # Trim to fit column width (6 chars)
+        try:
+            val = Decimal(rendered.replace(",", ""))
+            return self._fmt_balance(val, 2)
+        except Exception:
+            return rendered[:6] if rendered else "-"
 
     def _dashboard_free_compact(self, card: TelegramCardState) -> str:
         """Compact free fee display: X/3."""

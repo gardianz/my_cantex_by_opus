@@ -25,6 +25,7 @@ STARTUP_MODE_CHOICES = {
     "2": "free_only",
     "3": "free_then_swap",
     "4": "refill_cc",
+    "5": "check_accounts",
 }
 
 
@@ -68,9 +69,10 @@ def _prompt_startup_mode() -> str:
     print("2. Mode free swap only", flush=True)
     print("3. Mode free lalu swap", flush=True)
     print("4. Mode refill semua token ke CC lalu berhenti", flush=True)
+    print("5. Mode cek akun (lihat balance, reward, fee)", flush=True)
 
     while True:
-        print("Masukkan pilihan (1/2/3/4): ", end="", flush=True)
+        print("Masukkan pilihan (1/2/3/4/5): ", end="", flush=True)
         try:
             answer = input().strip()
         except EOFError:
@@ -144,7 +146,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--mode",
         default=None,
-        choices=["swap_only", "free_only", "free_then_swap", "refill_cc"],
+        choices=["swap_only", "free_only", "free_then_swap", "refill_cc", "check_accounts"],
         help="Override startup mode. Jika tidak diset, akan ditanya interaktif.",
     )
     return parser
