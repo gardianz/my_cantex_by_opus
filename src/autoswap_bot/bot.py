@@ -5080,164 +5080,141 @@ class AutoswapBot:
         return self.startup_mode == "check_accounts"
 
     async def _run_check_accounts(self) -> None:
-        """Mode cek akun: auth semua akun, ambil balance/reward/fee, tampilkan tabel, kirim ke Telegram."""
-        logger = AccountLoggerAdapter(self.log, {"account": "CHECK"})
-        logger.info("Mode cek akun dimulai — mengambil data semua akun...")
+        """Mode cek akun: auth semua akun, ambil data, render dashboard 1x, kirim Telegram, berhenti."""
+        CHECK_ACCOUNT_TIMEOUT = 60  # detik timeout per akun
 
-        rows: list[dict] = []
-        for account in self.config.accounts:
+        print("\n📊 Mode Cek Akun — memulai...", flush=True)
+        print(f"   Jumlah akun: {len(self.config.accounts)}", flush=True)
+        print("", flush=True)
+
+        cards: list[TelegramCardState] = []
+
+        for idx, account in enumerate(self.config.accounts, start=1):
             acc_logger = AccountLoggerAdapter(self.log, {"account": account.name})
-            sdk = self._build_sdk(account)
+            print(f"   [{idx}/{len(self.config.accounts)}] {account.name} — auth...", end="", flush=True)
+
+            card = TelegramCardState(
+                account_name=account.name,
+                display_index=account.display_index,
+                proxy_label=account.proxy_label,
+                strategy_label="check",
+                session_started_utc=datetime.now(timezone.utc),
+                total_rounds=0,
+                pair_targets={},
+                phase="CHECKING",
+                balances={symbol: Decimal("0") for symbol in TRACKED_SYMBOLS},
+            )
+
             try:
-                async with sdk:
-                    await sdk.authenticate(force=True)
-                    info = await sdk.get_account_info()
-                    balances = self._balances_by_symbol(info)
-
-                    # Fetch activity summary (reward data)
-                    summary = await self._fetch_activity_summary(sdk, acc_logger)
-
-                    # Scrape ccview fee data
-                    fee_result = None
-                    if info.address:
-                        from datetime import date as _date
-                        today = _date.today().isoformat()
-                        try:
-                            fee_result = await self.fee_scraper.fetch_actual_fee(info.address, today)
-                        except Exception as exc:
-                            acc_logger.warning("CCView scrape gagal: %s", exc)
-
-                    # Extract reward data
-                    yesterday_reward = "-"
-                    this_week_reward = "-"
-                    distributed = "-"
-                    funding = "-"
-                    if summary is not None:
-                        yesterday_reward = summary.rebates.get("yesterday", "-") or "-"
-                        this_week_reward = summary.rebates.get("this_week", "-") or "-"
-                        distributed = summary.distributed_reward or "-"
-                        funding = summary.funding_total or "-"
-
-                    # Extract fee data
-                    avg_fee = "-"
-                    fee_tx_count = 0
-                    if fee_result is not None and fee_result.success:
-                        avg_fee = str(fee_result.avg_fee_per_swap)
-                        fee_tx_count = fee_result.validator_tx_count
-
-                    rows.append({
-                        "name": account.name,
-                        "cc": balances.get("CC", Decimal("0")),
-                        "usdcx": balances.get("USDCx", Decimal("0")),
-                        "cbtc": balances.get("CBTC", Decimal("0")),
-                        "yesterday": yesterday_reward,
-                        "this_week": this_week_reward,
-                        "distributed": distributed,
-                        "funding": funding,
-                        "avg_fee": avg_fee,
-                        "fee_tx": fee_tx_count,
-                    })
-                    acc_logger.info(
-                        "OK | CC=%s | USDCx=%s | CBTC=%s | Rew.Y=%s",
-                        balances.get("CC", Decimal("0")),
-                        balances.get("USDCx", Decimal("0")),
-                        balances.get("CBTC", Decimal("0")),
-                        yesterday_reward,
-                    )
+                await asyncio.wait_for(
+                    self._check_single_account(account, card, acc_logger),
+                    timeout=CHECK_ACCOUNT_TIMEOUT,
+                )
+                print(
+                    f" OK | CC={card.balances.get('CC', Decimal('0')):.2f}"
+                    f" | USDCx={card.balances.get('USDCx', Decimal('0')):.2f}"
+                    f" | CBTC={card.balances.get('CBTC', Decimal('0')):.8f}",
+                    flush=True,
+                )
+                card.phase = "FINISHED"
+            except asyncio.TimeoutError:
+                print(f" TIMEOUT ({CHECK_ACCOUNT_TIMEOUT}s)", flush=True)
+                acc_logger.error("Timeout setelah %ss saat cek akun", CHECK_ACCOUNT_TIMEOUT)
+                card.phase = "FAILED_TIMEOUT"
             except Exception as exc:
+                print(f" ERROR: {exc}", flush=True)
                 acc_logger.error("Gagal cek akun: %s", exc)
-                rows.append({
-                    "name": account.name,
-                    "cc": Decimal("0"),
-                    "usdcx": Decimal("0"),
-                    "cbtc": Decimal("0"),
-                    "yesterday": "ERR",
-                    "this_week": "ERR",
-                    "distributed": "ERR",
-                    "funding": "ERR",
-                    "avg_fee": "ERR",
-                    "fee_tx": 0,
-                })
+                card.phase = "FAILED_ERROR"
 
-        # Build summary table
-        table_text = self._build_check_accounts_table(rows)
-        print(table_text, flush=True)
+            cards.append(card)
+            self.monitor._cards[account.name] = card
 
-        # Send to Telegram
+        print("", flush=True)
+        print("   Semua akun selesai dicek. Rendering dashboard...", flush=True)
+        print("", flush=True)
+
+        # Render dashboard terminal 1x (format sama seperti saat bot running)
+        # Bypass terminal_dashboard_enabled dan isatty check — langsung render
+        self._render_check_dashboard(cards)
+
+        # Kirim ke Telegram via _publish (format sama seperti dashboard)
         if self.config.runtime.telegram_enabled:
             try:
-                await self.monitor.start()
-                html_text = self._build_check_accounts_telegram_html(rows)
-                await self.monitor._request(
-                    "sendMessage",
-                    {
-                        "chat_id": self.config.runtime.telegram_chat_id,
-                        "text": html_text,
-                        "parse_mode": "HTML",
-                        "disable_web_page_preview": True,
-                    },
-                )
-                logger.info("Laporan cek akun terkirim ke Telegram")
+                # Force new message (reset message_id agar kirim baru, bukan edit)
+                old_msg_id = self.monitor._telegram_message_id
+                self.monitor._telegram_message_id = None
+                self.monitor._telegram_last_render_text = None
+                await self.monitor._publish(force=True)
+                # Restore jika perlu
+                if self.monitor._telegram_message_id is None:
+                    self.monitor._telegram_message_id = old_msg_id
+                print("   ✅ Laporan terkirim ke Telegram", flush=True)
             except Exception as exc:
-                logger.warning("Gagal kirim ke Telegram: %s", exc)
+                print(f"   ⚠️ Gagal kirim ke Telegram: {exc}", flush=True)
 
-        logger.info("Mode cek akun selesai.")
+        print("\n📊 Mode cek akun selesai.\n", flush=True)
 
-    def _build_check_accounts_table(self, rows: list[dict]) -> str:
-        """Build a terminal-friendly table for check accounts mode."""
-        lines = []
-        header = f"{'#':<3}{'Akun':<10}{'CC':>10}{'USDCx':>10}{'CBTC':>12}{'Rew.Y':>10}{'Rew.W':>10}{'Dist':>10}{'Fund':>10}{'AvgFee':>8}{'Tx':>5}"
-        sep = "-" * len(header)
-        lines.append(sep)
-        lines.append("  📊 CEK AKUN — Ringkasan")
-        lines.append(sep)
-        lines.append(header)
-        lines.append(sep)
-        for idx, row in enumerate(rows, start=1):
-            cc_str = f"{row['cc']:.2f}" if isinstance(row['cc'], Decimal) else str(row['cc'])
-            usdcx_str = f"{row['usdcx']:.2f}" if isinstance(row['usdcx'], Decimal) else str(row['usdcx'])
-            cbtc_str = f"{row['cbtc']:.8f}" if isinstance(row['cbtc'], Decimal) else str(row['cbtc'])
-            lines.append(
-                f"{idx:<3}{row['name']:<10}{cc_str:>10}{usdcx_str:>10}{cbtc_str:>12}"
-                f"{self._truncate(row['yesterday'], 10):>10}"
-                f"{self._truncate(row['this_week'], 10):>10}"
-                f"{self._truncate(row['distributed'], 10):>10}"
-                f"{self._truncate(row['funding'], 10):>10}"
-                f"{self._truncate(row['avg_fee'], 8):>8}"
-                f"{row['fee_tx']:>5}"
-            )
-        lines.append(sep)
-        return "\n".join(lines)
+    async def _check_single_account(
+        self,
+        account: AccountConfig,
+        card: TelegramCardState,
+        logger: AccountLoggerAdapter,
+    ) -> None:
+        """Auth 1 akun, fetch balance/reward/fee, populate card."""
+        sdk = self._build_sdk(account)
+        async with sdk:
+            logger.debug("Authenticating...")
+            await sdk.authenticate(force=True)
 
-    def _build_check_accounts_telegram_html(self, rows: list[dict]) -> str:
-        """Build HTML message for Telegram check accounts report."""
-        import html as html_mod
-        from datetime import datetime as _dt, timezone as _tz
-        now_str = _dt.now(_tz.utc).strftime("%d/%m/%Y %H:%M UTC")
-        parts = [
-            f"<b>📊 Cek Akun — {html_mod.escape(now_str)}</b>",
-            f"<b>{len(rows)} akun</b>",
-            "",
+            logger.debug("Fetching account info...")
+            info = await sdk.get_account_info()
+            balances = self._balances_by_symbol(info)
+            card.balances = balances
+
+            # Fetch activity summary (reward data)
+            logger.debug("Fetching activity summary...")
+            summary = await self._fetch_activity_summary(sdk, logger)
+            if summary is not None:
+                card.activity_summary = summary
+
+            # Scrape ccview fee data
+            if info.address:
+                logger.debug("Scraping CCView fee data...")
+                from datetime import date as _date
+                today = _date.today().isoformat()
+                try:
+                    fee_result = await self.fee_scraper.fetch_actual_fee(info.address, today)
+                    if fee_result is not None and fee_result.success:
+                        card.ccview_validator_fee_total = fee_result.validator_fee_total
+                        card.ccview_validator_tx_count = fee_result.validator_tx_count
+                        card.ccview_avg_fee_per_swap = fee_result.avg_fee_per_swap
+                except Exception as exc:
+                    logger.warning("CCView scrape gagal: %s", exc)
+
+    def _render_check_dashboard(self, cards: list[TelegramCardState]) -> None:
+        """Render dashboard terminal 1x untuk mode cek akun (bypass isatty/enabled check)."""
+        sorted_cards = sorted(cards, key=lambda c: c.display_index)
+        if not sorted_cards:
+            print("   (tidak ada data akun)", flush=True)
+            return
+
+        col_widths, table_lines = self.monitor._dashboard_table_lines(sorted_cards)
+        header_row = table_lines[0]
+        row_width = len(header_row) - 2
+        border = "+" + ("-" * row_width) + "+"
+        strong_border = "+" + ("=" * row_width) + "+"
+
+        lines = [
+            strong_border,
+            *self.monitor._dashboard_summary_lines(sorted_cards, row_width=row_width),
+            border,
+            *table_lines,
+            border,
         ]
-        for idx, row in enumerate(rows, start=1):
-            cc_str = f"{row['cc']:.4f}" if isinstance(row['cc'], Decimal) else str(row['cc'])
-            usdcx_str = f"{row['usdcx']:.4f}" if isinstance(row['usdcx'], Decimal) else str(row['usdcx'])
-            cbtc_str = f"{row['cbtc']:.8f}" if isinstance(row['cbtc'], Decimal) else str(row['cbtc'])
-            parts.append(
-                f"<b>{idx}. {html_mod.escape(row['name'])}</b>\n"
-                f"  Balance: CC {html_mod.escape(cc_str)} | U {html_mod.escape(usdcx_str)} | B {html_mod.escape(cbtc_str)}\n"
-                f"  Reward: Y {html_mod.escape(str(row['yesterday']))} | W {html_mod.escape(str(row['this_week']))}\n"
-                f"  Dist: {html_mod.escape(str(row['distributed']))} | Fund: {html_mod.escape(str(row['funding']))}\n"
-                f"  Fee: avg {html_mod.escape(str(row['avg_fee']))} CC/tx ({row['fee_tx']} tx)"
-            )
-            parts.append("")
-        return "\n".join(parts)
 
-    @staticmethod
-    def _truncate(value: str, max_len: int) -> str:
-        """Truncate string to max_len characters."""
-        s = str(value) if value else "-"
-        return s[:max_len] if len(s) > max_len else s
+        rendered = "\n".join(lines)
+        sys.stdout.write(rendered + "\n")
+        sys.stdout.flush()
 
     def _startup_mode_uses_free_swap(self) -> bool:
         return self.startup_mode in {"free_only", "free_then_swap"}
