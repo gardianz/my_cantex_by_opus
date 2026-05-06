@@ -504,6 +504,53 @@ class FeeScraper:
         """Get the latest scrape result for an account."""
         return self._latest_results.get(account_name)
 
+    async def scrape_now(self, *, party_id: str, account_name: str) -> ActualFeeResult | None:
+        """Synchronous (awaited) scrape — fetch ccview data immediately and return result.
+
+        Unlike trigger_background_scrape, this blocks until the scrape completes.
+        Use after swap progress confirmed or after refill to guarantee card update.
+        Respects cooldown to avoid spamming.
+        """
+        if not party_id:
+            return None
+
+        # Cooldown check (reduced to 3s for synchronous calls)
+        now = time.monotonic()
+        last_time = self._last_scrape_time.get(account_name, 0.0)
+        if now - last_time < 3.0:
+            # Return cached result if available
+            cached = self._latest_results.get(account_name)
+            if cached is not None and cached.success:
+                return cached
+            # Otherwise wait out the cooldown
+            await asyncio.sleep(3.0 - (now - last_time))
+
+        try:
+            today = datetime.now(timezone.utc).date().isoformat()
+            async with self._scrape_lock:
+                result = await self.fetch_actual_fee(party_id, today)
+
+            if result.success:
+                self._latest_results[account_name] = result
+                self._last_scrape_time[account_name] = time.monotonic()
+                self.log.info(
+                    "CCView scrape_now OK | %s | fee=%s CC (%s tx) | avg=%s CC/swap",
+                    account_name,
+                    result.validator_fee_total,
+                    result.validator_tx_count,
+                    result.avg_fee_per_swap,
+                )
+            else:
+                self.log.warning(
+                    "CCView scrape_now failed | %s | error=%s",
+                    account_name,
+                    result.error,
+                )
+            return result
+        except Exception as exc:
+            self.log.warning("CCView scrape_now exception | %s | %s", account_name, exc)
+            return None
+
     def get_actual_avg_fee(self, account_name: str) -> Decimal | None:
         """Get the actual average fee per swap from latest scrape.
 

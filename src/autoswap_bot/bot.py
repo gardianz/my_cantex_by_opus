@@ -321,11 +321,16 @@ class AutoswapBot:
                     self.config.runtime.random_seed if self.config.runtime.random_seed is not None else "-",
                 )
                 self._log_balances(logger, info, "Balance awal")
+                initial_balances = self._balances_by_symbol(info)
                 await self.monitor.update_balances(
                     monitor_card,
-                    self._balances_by_symbol(info),
+                    initial_balances,
                     force=True,
                 )
+                # Record CC balance at start of day for daily loss calculation
+                cc_start = initial_balances.get(CC_SYMBOL, Decimal("0"))
+                await self.monitor.set_cc_balance_start_of_day(monitor_card, cc_start)
+                logger.info("CC balance start of day recorded: %s", cc_start)
                 baseline_activity = await self._fetch_activity_summary(sdk, logger)
                 result.activity_summary = baseline_activity
                 await self.monitor.update_activity(
@@ -2799,6 +2804,26 @@ class AutoswapBot:
                 force=True,
             )
 
+        # --- After refill: scrape ccview for updated gas fee ---
+        await self._scrape_ccview_and_update_card(
+            account_name=account.name,
+            monitor_card=monitor_card,
+        )
+
+        # --- After refill: compute daily CC loss ---
+        cc_after_refill = final_balances.get(CC_SYMBOL, Decimal("0"))
+        await self.monitor.update_daily_cc_loss(
+            monitor_card,
+            cc_after_refill,
+        )
+        if monitor_card is not None and monitor_card.cc_balance_start_of_day > Decimal("0"):
+            logger.info(
+                "Daily CC loss: start=%s | after_refill=%s | loss=%s",
+                monitor_card.cc_balance_start_of_day,
+                cc_after_refill,
+                monitor_card.daily_cc_loss,
+            )
+
     def _sample_execution_amount(
         self,
         amount_range,
@@ -3994,6 +4019,46 @@ class AutoswapBot:
 
             task.add_done_callback(_log_card_update_failure)
 
+    async def _scrape_ccview_and_update_card(
+        self,
+        *,
+        account_name: str,
+        monitor_card: TelegramCardState | None,
+    ) -> None:
+        """Synchronous (awaited) ccview scrape + immediate card update.
+
+        Called after swap progress is confirmed and after refill completes.
+        Guarantees the gas fee data on the dashboard is up-to-date.
+        Non-blocking in the sense that it doesn't block the event loop,
+        but it DOES await the result before continuing.
+        """
+        party_id = self._account_party_ids.get(account_name, "")
+        if not party_id:
+            return
+
+        # Small delay for ccview.io indexing (reduced from 5s to 3s for faster updates)
+        await asyncio.sleep(3)
+
+        result = await self.fee_scraper.scrape_now(
+            party_id=party_id,
+            account_name=account_name,
+        )
+
+        if result is not None and result.success and monitor_card is not None:
+            await self.monitor.update_ccview_fee(
+                monitor_card,
+                validator_fee_total=result.validator_fee_total,
+                validator_tx_count=result.validator_tx_count,
+                avg_fee_per_swap=result.avg_fee_per_swap,
+            )
+            self.log.debug(
+                "CCView sync update applied | %s | fee=%s | tx=%s | avg=%s",
+                account_name,
+                result.validator_fee_total,
+                result.validator_tx_count,
+                result.avg_fee_per_swap,
+            )
+
     def _schedule_startup_ccview_update(
         self,
         *,
@@ -4441,10 +4506,9 @@ class AutoswapBot:
                     prepared_run=prepared_run,
                     result=result,
                 )
-                # Trigger ccview.io fee scrape in background (non-blocking)
-                self._trigger_fee_scrape_if_available(
+                # Trigger ccview.io fee scrape — synchronous await for guaranteed card update
+                await self._scrape_ccview_and_update_card(
                     account_name=account.name,
-                    completed_round=result.completed_rounds,
                     monitor_card=monitor_card,
                 )
                 if self._weekly_stop_due_utc():
@@ -4646,6 +4710,11 @@ class AutoswapBot:
                     prepared_run=prepared_run,
                     result=result,
                 )
+                # Scrape ccview for updated gas fee after round completion
+                await self._scrape_ccview_and_update_card(
+                    account_name=account.name,
+                    monitor_card=monitor_card,
+                )
                 if self._weekly_stop_due_utc():
                     await self._perform_weekly_stop(
                         logger=logger,
@@ -4846,6 +4915,9 @@ class AutoswapBot:
         # Trigger monitor card rollover
         if monitor_card is not None:
             self.monitor._rollover_card_if_needed(monitor_card)
+            # Reset daily CC loss for new day
+            current_cc = monitor_card.balances.get(CC_SYMBOL, Decimal("0"))
+            await self.monitor.set_cc_balance_start_of_day(monitor_card, current_cc)
 
         await self.monitor.log_event(
             monitor_card,
@@ -4981,6 +5053,16 @@ class AutoswapBot:
         # Trigger monitor card rollover
         if monitor_card is not None:
             self.monitor._rollover_card_if_needed(monitor_card)
+
+        # Reset daily CC loss tracking for new day
+        # The CC balance at this point becomes the new start-of-day
+        if monitor_card is not None:
+            current_cc = monitor_card.balances.get(CC_SYMBOL, Decimal("0"))
+            await self.monitor.set_cc_balance_start_of_day(monitor_card, current_cc)
+            logger.info(
+                "Daily reset: CC balance start of new day = %s",
+                current_cc,
+            )
 
         # Log event to telegram
         await self.monitor.log_event(
@@ -5502,6 +5584,13 @@ class AutoswapBot:
                 f"🔁 Round sync from trading history: {synced_completed_rounds}/{prepared_run.rounds}",
                 force=force_log,
             )
+            # Trigger ccview scrape saat progress swap bertambah (non-blocking background)
+            if synced_completed_rounds > previous_completed_rounds:
+                self._trigger_fee_scrape_if_available(
+                    account_name=account.name,
+                    completed_round=synced_completed_rounds,
+                    monitor_card=monitor_card,
+                )
         return synced_completed_rounds
 
     async def _sleep_or_stop(self, seconds: float) -> None:

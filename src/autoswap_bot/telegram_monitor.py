@@ -91,6 +91,10 @@ class TelegramCardState:
     fee_quote_history: list[Decimal] = field(default_factory=list)
     total_cycle_spread_loss: dict[str, Decimal] = field(default_factory=dict)
     cycle_count: int = 0
+    # Daily CC loss tracking (simple: CC_start_of_day - CC_after_refill)
+    cc_balance_start_of_day: Decimal = field(default_factory=lambda: Decimal("0"))
+    daily_cc_loss: Decimal = field(default_factory=lambda: Decimal("0"))
+    daily_cc_loss_set: bool = False  # True once loss has been computed after refill
     # CCView actual fee data (from fee_scraper)
     ccview_validator_fee_total: Decimal = field(default_factory=lambda: Decimal("0"))
     ccview_validator_tx_count: int = 0
@@ -336,6 +340,34 @@ class TelegramMonitor:
             card.total_cycle_spread_loss.get(symbol, Decimal("0")) + cycle_result.spread_loss
         )
         card.cycle_count += 1
+
+    async def set_cc_balance_start_of_day(
+        self,
+        card: TelegramCardState | None,
+        cc_balance: Decimal,
+    ) -> None:
+        """Set the CC balance at start of day for daily loss calculation."""
+        if card is None:
+            return
+        card.cc_balance_start_of_day = cc_balance
+        card.daily_cc_loss = Decimal("0")
+        card.daily_cc_loss_set = False
+
+    async def update_daily_cc_loss(
+        self,
+        card: TelegramCardState | None,
+        cc_balance_after_refill: Decimal,
+        *,
+        force: bool = True,
+    ) -> None:
+        """Update daily CC loss after refill: loss = CC_start - CC_after_refill."""
+        if card is None:
+            return
+        if card.cc_balance_start_of_day <= Decimal("0"):
+            return
+        card.daily_cc_loss = card.cc_balance_start_of_day - cc_balance_after_refill
+        card.daily_cc_loss_set = True
+        await self._refresh_outputs(card, force=force)
 
     async def update_free_fee_status(
         self,
@@ -1675,7 +1707,20 @@ class TelegramMonitor:
         return ", ".join(parts) if parts else "-"
 
     def _format_cycle_spread_loss_compact(self, card: TelegramCardState) -> str:
-        """Format round-trip cycle spread loss for compact display."""
+        """Format daily CC loss for compact display.
+
+        Uses simple formula: CC_start_of_day - CC_after_refill.
+        Falls back to per-cycle tracking if daily loss not yet computed.
+        """
+        # Prioritize simple daily CC loss if available
+        if card.daily_cc_loss_set:
+            loss = card.daily_cc_loss
+            if loss == Decimal("0"):
+                return "0"
+            rendered = format(loss, ".2f").rstrip("0").rstrip(".")
+            return f"{rendered} CC"
+
+        # Fallback: show per-cycle spread loss (legacy, before first refill)
         values = card.total_cycle_spread_loss
         if not values:
             return "-"
