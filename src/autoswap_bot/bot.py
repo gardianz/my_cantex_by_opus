@@ -2808,6 +2808,13 @@ class AutoswapBot:
         await self._scrape_ccview_and_update_card(
             account_name=account.name,
             monitor_card=monitor_card,
+            force=True,
+        )
+        self._schedule_ccview_scrape_after_progress(
+            account_name=account.name,
+            completed_round=result.completed_rounds,
+            monitor_card=monitor_card,
+            reason="refill",
         )
 
         # --- After refill: compute daily CC loss ---
@@ -4024,6 +4031,7 @@ class AutoswapBot:
         *,
         account_name: str,
         monitor_card: TelegramCardState | None,
+        force: bool = False,
     ) -> None:
         """Synchronous (awaited) ccview scrape + immediate card update.
 
@@ -4034,6 +4042,11 @@ class AutoswapBot:
         """
         party_id = self._account_party_ids.get(account_name, "")
         if not party_id:
+            self.log.warning(
+                "CCView scrape skipped: party_id tidak tersedia untuk %s (available: %s)",
+                account_name,
+                list(self._account_party_ids.keys())[:5],
+            )
             return
 
         # Small delay for ccview.io indexing (reduced from 5s to 3s for faster updates)
@@ -4042,6 +4055,7 @@ class AutoswapBot:
         result = await self.fee_scraper.scrape_now(
             party_id=party_id,
             account_name=account_name,
+            force=force,
         )
 
         if result is not None and result.success and monitor_card is not None:
@@ -4058,6 +4072,77 @@ class AutoswapBot:
                 result.validator_tx_count,
                 result.avg_fee_per_swap,
             )
+
+    def _schedule_ccview_scrape_after_progress(
+        self,
+        *,
+        account_name: str,
+        completed_round: int,
+        monitor_card: TelegramCardState | None,
+        reason: str,
+    ) -> None:
+        """Schedule ccview scrape after progress/refill without blocking swap flow."""
+        party_id = self._account_party_ids.get(account_name, "")
+        if not party_id or monitor_card is None:
+            self.log.warning(
+                "CCView progress scrape skipped | account=%s | round=%s | reason=%s | party_id_available=%s | card=%s",
+                account_name,
+                completed_round,
+                reason,
+                bool(party_id),
+                monitor_card is not None,
+            )
+            return
+
+        async def _runner() -> None:
+            # ccview indexing can lag; retry with forced refresh so cached startup data is not reused.
+            for attempt, delay_seconds in enumerate((8, 18, 35), start=1):
+                try:
+                    await asyncio.sleep(delay_seconds)
+                    result = await self.fee_scraper.scrape_now(
+                        party_id=party_id,
+                        account_name=account_name,
+                        force=True,
+                    )
+                    if result is not None and result.success:
+                        await self.monitor.update_ccview_fee(
+                            monitor_card,
+                            validator_fee_total=result.validator_fee_total,
+                            validator_tx_count=result.validator_tx_count,
+                            avg_fee_per_swap=result.avg_fee_per_swap,
+                        )
+                        self.log.info(
+                            "CCView progress scrape applied | account=%s | round=%s | reason=%s | attempt=%s | fee=%s | tx=%s | avg=%s",
+                            account_name,
+                            completed_round,
+                            reason,
+                            attempt,
+                            result.validator_fee_total,
+                            result.validator_tx_count,
+                            result.avg_fee_per_swap,
+                        )
+                        return
+                    self.log.warning(
+                        "CCView progress scrape no result | account=%s | round=%s | reason=%s | attempt=%s",
+                        account_name,
+                        completed_round,
+                        reason,
+                        attempt,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    self.log.warning(
+                        "CCView progress scrape exception | account=%s | round=%s | reason=%s | attempt=%s | %s",
+                        account_name,
+                        completed_round,
+                        reason,
+                        attempt,
+                        exc,
+                    )
+
+        task = asyncio.create_task(_runner())
+        task.add_done_callback(lambda t: None)
 
     def _schedule_startup_ccview_update(
         self,
@@ -4506,10 +4591,12 @@ class AutoswapBot:
                     prepared_run=prepared_run,
                     result=result,
                 )
-                # Trigger ccview.io fee scrape — synchronous await for guaranteed card update
-                await self._scrape_ccview_and_update_card(
+                # Trigger ccview.io fee scrape from confirmed progress (non-blocking)
+                self._schedule_ccview_scrape_after_progress(
                     account_name=account.name,
+                    completed_round=result.completed_rounds,
                     monitor_card=monitor_card,
+                    reason="round_complete",
                 )
                 if self._weekly_stop_due_utc():
                     await self._perform_weekly_stop(
@@ -4710,10 +4797,12 @@ class AutoswapBot:
                     prepared_run=prepared_run,
                     result=result,
                 )
-                # Scrape ccview for updated gas fee after round completion
-                await self._scrape_ccview_and_update_card(
+                # Trigger ccview.io fee scrape from confirmed progress (non-blocking)
+                self._schedule_ccview_scrape_after_progress(
                     account_name=account.name,
+                    completed_round=result.completed_rounds,
                     monitor_card=monitor_card,
+                    reason="round_complete",
                 )
                 if self._weekly_stop_due_utc():
                     await self._perform_weekly_stop(
@@ -5584,12 +5673,13 @@ class AutoswapBot:
                 f"🔁 Round sync from trading history: {synced_completed_rounds}/{prepared_run.rounds}",
                 force=force_log,
             )
-            # Trigger ccview scrape saat progress swap bertambah (non-blocking background)
+            # Trigger ccview scrape saat progress swap bertambah (background, non-blocking)
             if synced_completed_rounds > previous_completed_rounds:
-                self._trigger_fee_scrape_if_available(
+                self._schedule_ccview_scrape_after_progress(
                     account_name=account.name,
                     completed_round=synced_completed_rounds,
                     monitor_card=monitor_card,
+                    reason="progress",
                 )
         return synced_completed_rounds
 

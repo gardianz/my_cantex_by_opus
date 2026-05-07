@@ -644,16 +644,22 @@ Ini adalah **false positive** karena:
 
 **Fix**: `MIN_TICKET_SIZE` sekarang ditangani secara terpisah dan **tidak pernah** menaikkan `consecutive_balance_blocked_rounds`. Bot tetap retry dengan topup guard tanpa risiko false-positive stop.
 
-### Gas fee dari ccview tidak update setelah swap
+### Gas fee dari ccview tidak update setelah progress swap bertambah
 
-Jika gas fee di monitor Telegram tidak update setelah swap berhasil, kemungkinan penyebab:
+Kolom `Gas` dashboard memakai total fee validator dari ccview.io untuk tanggal UTC hari ini. Trigger update **bukan lagi berdasarkan asumsi swap internal berhasil**, melainkan berdasarkan progress swap yang sudah terkonfirmasi dari trading history:
 
-1. `party_id` tidak tersimpan — cek log `CCView party_id stored` saat startup
-2. Scrape berhasil tapi card update gagal — cek log `CCView card update`
-3. Cooldown terlalu ketat — minimum 5 detik antar scrape per account
+1. Bot sync trading history harian.
+2. Jika progress naik, misalnya `24/25 -> 25/25`, bot menjadwalkan scrape ccview.io secara background.
+3. Scrape tidak mengganggu proses swap karena berjalan non-blocking.
+4. Scrape memakai forced refresh supaya tidak memakai cache startup.
+5. Bot retry scrape pada delay 8s, 18s, dan 35s karena ccview.io bisa terlambat meng-index transaksi.
+6. Setelah refill selesai, bot melakukan scrape langsung dan menjadwalkan retry background agar fee refill ikut masuk.
 
-**Perbaikan yang diterapkan**:
-- Logging ditingkatkan dari DEBUG ke INFO/WARNING agar mudah di-trace
-- Delay card update dikurangi dari 12s ke 8s dengan retry otomatis jika result belum ready
-- Periodic scrape interval dikurangi dari 120s ke 90s
-- Exception di background task tidak lagi di-swallow — akan muncul di log sebagai WARNING
+Jika `Gas` masih tidak berubah, cek log berikut:
+
+- `CCView party_id stored` — memastikan party_id tersedia untuk akun.
+- `CCView progress scrape applied` — scrape berbasis progress berhasil diterapkan ke dashboard.
+- `CCView progress scrape skipped` — biasanya party_id/card belum tersedia.
+- `CCView progress scrape exception` — error jaringan/API ccview.
+
+Kolom `Gas` formatnya `total_fee(tx_count)`, contoh `5.59(12)` artinya total validator fee hari ini `5.59 CC` dari `12` transaksi validator.

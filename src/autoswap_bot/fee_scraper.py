@@ -504,12 +504,18 @@ class FeeScraper:
         """Get the latest scrape result for an account."""
         return self._latest_results.get(account_name)
 
-    async def scrape_now(self, *, party_id: str, account_name: str) -> ActualFeeResult | None:
+    async def scrape_now(
+        self,
+        *,
+        party_id: str,
+        account_name: str,
+        force: bool = False,
+    ) -> ActualFeeResult | None:
         """Synchronous (awaited) scrape — fetch ccview data immediately and return result.
 
         Unlike trigger_background_scrape, this blocks until the scrape completes.
         Use after swap progress confirmed or after refill to guarantee card update.
-        Respects cooldown to avoid spamming.
+        Respects cooldown to avoid spamming unless force=True.
         """
         if not party_id:
             return None
@@ -517,7 +523,7 @@ class FeeScraper:
         # Cooldown check (reduced to 3s for synchronous calls)
         now = time.monotonic()
         last_time = self._last_scrape_time.get(account_name, 0.0)
-        if now - last_time < 3.0:
+        if not force and now - last_time < 3.0:
             # Return cached result if available
             cached = self._latest_results.get(account_name)
             if cached is not None and cached.success:
