@@ -78,9 +78,9 @@ class FeeScraper:
         # Store latest results per account
         self._latest_results: dict[str, ActualFeeResult] = {}
         # Background tasks
-        self._background_tasks: set[asyncio.Task] = set()
+        self._background_tasks: set[asyncio.Task[None]] = set()
         # Periodic scrape tasks
-        self._periodic_tasks: dict[str, asyncio.Task] = {}
+        self._periodic_tasks: dict[str, asyncio.Task[None]] = {}
 
     async def _ensure_client(self) -> httpx.AsyncClient:
         """Lazy init httpx client with session."""
