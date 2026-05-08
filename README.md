@@ -198,7 +198,7 @@ auto_create_intent_account = true
   - Jika `true`, bot yang sedang berjalan akan berhenti saat memasuki hari Senin UTC
   - Bot tidak melakukan refill otomatis pada weekly stop
   - Jika bot dijalankan ulang pada hari Senin UTC, bot berjalan normal
-  - Refill manual tetap tersedia lewat mode `6`
+  - Refill manual tetap tersedia lewat mode `4`
   - Config lama `weekly_refill_on_monday_utc` masih dibaca sebagai fallback
 
 - `full_24h_min_gap_minutes`
@@ -395,42 +395,51 @@ Catatan:
 
 Bot sekarang selalu berjalan dalam mode 24 jam.
 
-Saat bot dijalankan, akan muncul 6 pilihan mode startup:
+Saat bot dijalankan, akan muncul pilihan strategi, lalu 5 pilihan mode startup:
 
-1. `Mode hanya ambil free swap`
-2. `Mode ambil free swap lalu lanjut swap sesuai batas swap dan fee swap yang ditentukan`
-3. `Mode swap sesuai batas swap dan fee swap yang ditentukan`
-4. `Mode swap sesuai jam plan dan batas fee yang ditentukan`
-5. `Mode hitung estimasi kebutuhan CC dari config saat ini`
-6. `Mode refill semua token selain CC ke CC lalu berhenti`
+1. `Mode swap langsung (direct)`
+2. `Mode free swap only`
+3. `Mode free lalu swap`
+4. `Mode refill semua token ke CC lalu berhenti`
+5. `Mode cek akun (lihat balance, reward, fee)`
+
+Setelah memilih mode swap harian (`1`, `2`, atau `3`), bot juga menanyakan target refill saat progress swap tercapai:
+
+1. `Mode Refill ke CC`
+2. `Mode Refill ke USDCx`
 
 Arti mode:
 
 - Mode `1`
+  - Bot langsung swap normal
+  - Semua swap tetap patuh pada fee cap
+- Mode `2`
   - Bot hanya memakai jatah free swap harian
   - Setelah jatah free swap hari itu habis, bot menunggu hari UTC berikutnya jika `full_24h_auto_restart = true`
-- Mode `2`
+- Mode `3`
   - Bot memprioritaskan free swap harian lebih dulu
   - Hanya hop free swap yang benar-benar memakai jatah harian boleh bypass fee cap
   - Setelah jatah free swap habis, bot lanjut swap normal dengan fee cap
-- Mode `3`
-  - Bot langsung swap normal
-  - Semua swap tetap patuh pada fee cap
 - Mode `4`
-  - Bot memakai plan jadwal random dalam window harian UTC
-  - Fee cap tetap berlaku
-- Mode `5`
-  - Bot tidak menjalankan swap
-  - Bot hanya menghitung estimasi kebutuhan `CC` per account dari config aktif
-  - Dasar hitung utamanya: `rounds.max`, `reserve_fee`, `reserve_kritis`, `amounts.CC.max`, `strategy`, dan `max_network_fee_cc_per_execution`
-  - Estimasi memakai angka konservatif
-  - Benefit `free swap` harian tidak dikurangkan
-  - Network fee runtime memakai data quote swap sebagai sumber utama karena fee real dari history/funding sering telat atau tidak lengkap
-- Mode `6`
   - Bot tidak menjalankan round harian
   - Bot langsung swap semua token non-CC (`USDCx`, `CBTC`) ke `CC`
   - Refill tetap mematuhi `max_network_fee_cc_per_execution`
   - Setelah refill selesai atau tidak bisa lanjut, bot berhenti
+- Mode `5`
+  - Bot tidak menjalankan swap
+  - Bot hanya cek semua akun: balance, progress, reward, distributed, funding, dan fee ccview
+  - Tampilan memakai dashboard yang sama dengan mode running
+  - Setelah render dan kirim Telegram, bot berhenti
+
+Target refill setelah progress tercapai:
+
+- `Refill ke CC`
+  - Setelah quota round tercapai, bot convert semua token non-CC ke `CC`
+  - Rumus `CyLoss` harian dihitung sebagai `CC awal hari - CC setelah refill`
+- `Refill ke USDCx`
+  - Setelah quota round tercapai, bot convert semua token selain `USDCx` (`CC`, `CBTC`) ke `USDCx`
+  - Tetap mematuhi fee cap dan tetap scrape ccview setelah refill
+  - `CyLoss` berbasis saldo CC hanya dihitung saat target akhir adalah `CC`
 
 Perilaku umum mode 24 jam:
 

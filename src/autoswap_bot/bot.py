@@ -89,10 +89,18 @@ MAX_CONSECUTIVE_MIN_TICKET_RETRIES = 3
 
 
 class AutoswapBot:
-    def __init__(self, config: BotConfig, *, repo_root: Path, startup_mode: str) -> None:
+    def __init__(
+        self,
+        config: BotConfig,
+        *,
+        repo_root: Path,
+        startup_mode: str,
+        post_target_refill_symbol: str = CC_SYMBOL,
+    ) -> None:
         self.config = config
         self.repo_root = repo_root
         self.startup_mode = startup_mode
+        self.post_target_refill_symbol = post_target_refill_symbol
         self.log = logging.getLogger("autoswap_bot")
         self.startup_utc_date = datetime.now(timezone.utc).date()
         self._prompt_lock = asyncio.Lock()
@@ -356,8 +364,8 @@ class AutoswapBot:
                     )
                     used_network_fee: defaultdict[str, Decimal] = defaultdict(Decimal)
                     used_swap_fee: defaultdict[str, Decimal] = defaultdict(Decimal)
-                    # Refill non-CC ke CC sebelum sleep (mematuhi fee cap)
-                    await self._refill_non_cc_to_cc_after_target(
+                    # Refill ke target pilihan sebelum sleep (mematuhi fee cap)
+                    await self._refill_after_target(
                         sdk=sdk,
                         router=router,
                         account=account,
@@ -2553,9 +2561,16 @@ class AutoswapBot:
         )
 
     def _non_cc_balances_remaining(self, balances: dict[str, Decimal]) -> dict[str, Decimal]:
+        return self._non_target_balances_remaining(balances, CC_SYMBOL)
+
+    def _non_target_balances_remaining(
+        self,
+        balances: dict[str, Decimal],
+        target_symbol: str,
+    ) -> dict[str, Decimal]:
         remaining: dict[str, Decimal] = {}
         for symbol in TRACKED_SYMBOLS:
-            if symbol == CC_SYMBOL:
+            if symbol == target_symbol:
                 continue
             amount = balances.get(symbol, Decimal("0"))
             if amount > dust_for_symbol(symbol):
@@ -2693,7 +2708,7 @@ class AutoswapBot:
                 force=True,
             )
 
-    async def _refill_non_cc_to_cc_after_target(
+    async def _refill_after_target(
         self,
         *,
         sdk: ExtendedCantexSDK,
@@ -2705,26 +2720,29 @@ class AutoswapBot:
         used_swap_fee: defaultdict[str, Decimal],
         result: AccountResult,
     ) -> None:
-        """Refill semua non-CC ke CC setelah target tercapai — untuk SEMUA strategi.
+        """Refill semua token selain target ke target setelah target swap tercapai.
 
         Ini adalah cleanup step: setelah semua round selesai, kembalikan sisa
-        USDCx/CBTC ke CC agar saldo bersih untuk hari berikutnya.
+        token lain ke target pilihan agar saldo bersih untuk hari berikutnya.
         MEMATUHI fee cap — tunggu fee turun sebelum refill.
         """
+        target_symbol = self.post_target_refill_symbol
         balances = self._balances_by_symbol(await sdk.get_account_info())
-        remaining = self._non_cc_balances_remaining(balances)
+        remaining = self._non_target_balances_remaining(balances, target_symbol)
         if not remaining:
-            logger.debug("Refill after target: tidak ada sisa non-CC untuk di-refill")
+            logger.debug("Refill after target: tidak ada sisa non-%s untuk di-refill", target_symbol)
             return
 
         logger.info(
-            "Refill after target: mengembalikan sisa non-CC ke CC | sisa=%s | strategy=%s",
+            "Refill after target: mengembalikan sisa non-%s ke %s | sisa=%s | strategy=%s",
+            target_symbol,
+            target_symbol,
             self._format_amount_map(remaining),
             account.strategy().label,
         )
         await self.monitor.log_event(
             monitor_card,
-            f"🔄 Refill after target: converting {self._format_amount_map(remaining)} back to CC (respecting fee cap)",
+            f"🔄 Refill after target: converting {self._format_amount_map(remaining)} to {target_symbol} (respecting fee cap)",
             force=True,
         )
         await self.monitor.update_status(
@@ -2739,14 +2757,14 @@ class AutoswapBot:
         for iteration in range(max_iterations):
             self._raise_if_stop_requested()
             balances = self._balances_by_symbol(await sdk.get_account_info())
-            remaining = self._non_cc_balances_remaining(balances)
+            remaining = self._non_target_balances_remaining(balances, target_symbol)
             if not remaining:
                 break
 
             recovered_tx = await self._recover_to_symbol(
                 sdk=sdk,
                 router=router,
-                target_symbol=CC_SYMBOL,
+                target_symbol=target_symbol,
                 cc_reserve=Decimal("0"),
                 logger=logger,
                 monitor_card=monitor_card,
@@ -2783,12 +2801,13 @@ class AutoswapBot:
 
         # Final balance check — pastikan refill berhasil sebelum NEXT-DAY
         final_balances = self._balances_by_symbol(await sdk.get_account_info())
-        final_remaining = self._non_cc_balances_remaining(final_balances)
+        final_remaining = self._non_target_balances_remaining(final_balances, target_symbol)
         await self.monitor.update_balances(monitor_card, final_balances, force=True)
 
         if final_remaining:
             logger.warning(
-                "Refill after target: MASIH ADA sisa non-CC setelah refill: %s",
+                "Refill after target: MASIH ADA sisa non-%s setelah refill: %s",
+                target_symbol,
                 self._format_amount_map(final_remaining),
             )
             await self.monitor.log_event(
@@ -2797,10 +2816,10 @@ class AutoswapBot:
                 force=True,
             )
         else:
-            logger.info("Refill after target: ✅ semua non-CC berhasil di-refill ke CC")
+            logger.info("Refill after target: ✅ semua non-%s berhasil di-refill ke %s", target_symbol, target_symbol)
             await self.monitor.log_event(
                 monitor_card,
-                f"✅ Refill complete: {total_tx} swap(s) | CC={final_balances.get(CC_SYMBOL, Decimal('0'))}",
+                f"✅ Refill complete: {total_tx} swap(s) | {target_symbol}={final_balances.get(target_symbol, Decimal('0'))}",
                 force=True,
             )
 
@@ -2817,19 +2836,20 @@ class AutoswapBot:
             reason="refill",
         )
 
-        # --- After refill: compute daily CC loss ---
-        cc_after_refill = final_balances.get(CC_SYMBOL, Decimal("0"))
-        await self.monitor.update_daily_cc_loss(
-            monitor_card,
-            cc_after_refill,
-        )
-        if monitor_card is not None and monitor_card.cc_balance_start_of_day > Decimal("0"):
-            logger.info(
-                "Daily CC loss: start=%s | after_refill=%s | loss=%s",
-                monitor_card.cc_balance_start_of_day,
+        # --- After refill: compute daily CC loss only when final target is CC ---
+        if target_symbol == CC_SYMBOL:
+            cc_after_refill = final_balances.get(CC_SYMBOL, Decimal("0"))
+            await self.monitor.update_daily_cc_loss(
+                monitor_card,
                 cc_after_refill,
-                monitor_card.daily_cc_loss,
             )
+            if monitor_card is not None and monitor_card.cc_balance_start_of_day > Decimal("0"):
+                logger.info(
+                    "Daily CC loss: start=%s | after_refill=%s | loss=%s",
+                    monitor_card.cc_balance_start_of_day,
+                    cc_after_refill,
+                    monitor_card.daily_cc_loss,
+                )
 
     def _sample_execution_amount(
         self,
@@ -4501,8 +4521,8 @@ class AutoswapBot:
                 )
                 return
             if result.completed_rounds >= prepared_run.rounds:
-                # Refill semua non-CC ke CC sebelum sleep (untuk SEMUA strategi)
-                await self._refill_non_cc_to_cc_after_target(
+                # Refill semua non-target ke target pilihan sebelum sleep (untuk SEMUA strategi)
+                await self._refill_after_target(
                     sdk=sdk,
                     router=router,
                     account=account,
@@ -4606,8 +4626,8 @@ class AutoswapBot:
                     )
                     return
                 if result.completed_rounds >= prepared_run.rounds:
-                    # Refill semua non-CC ke CC sebelum sleep (untuk SEMUA strategi)
-                    await self._refill_non_cc_to_cc_after_target(
+                    # Refill semua non-target ke target pilihan sebelum sleep (untuk SEMUA strategi)
+                    await self._refill_after_target(
                         sdk=sdk,
                         router=router,
                         account=account,
@@ -4697,8 +4717,8 @@ class AutoswapBot:
                 )
                 return
             if result.completed_rounds >= prepared_run.rounds:
-                # Refill semua non-CC ke CC sebelum sleep (untuk SEMUA strategi)
-                await self._refill_non_cc_to_cc_after_target(
+                # Refill semua non-target ke target pilihan sebelum sleep (untuk SEMUA strategi)
+                await self._refill_after_target(
                     sdk=sdk,
                     router=router,
                     account=account,
@@ -4812,8 +4832,8 @@ class AutoswapBot:
                     )
                     return
                 if result.completed_rounds >= prepared_run.rounds:
-                    # Refill semua non-CC ke CC sebelum sleep (untuk SEMUA strategi)
-                    await self._refill_non_cc_to_cc_after_target(
+                    # Refill semua non-target ke target pilihan sebelum sleep (untuk SEMUA strategi)
+                    await self._refill_after_target(
                         sdk=sdk,
                         router=router,
                         account=account,

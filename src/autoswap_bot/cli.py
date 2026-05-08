@@ -28,6 +28,11 @@ STARTUP_MODE_CHOICES = {
     "5": "check_accounts",
 }
 
+POST_TARGET_REFILL_CHOICES = {
+    "1": "CC",
+    "2": "USDCx",
+}
+
 
 def _default_startup_mode() -> str:
     return "free_then_swap"
@@ -81,6 +86,30 @@ def _prompt_startup_mode() -> str:
         startup_mode = STARTUP_MODE_CHOICES.get(answer)
         if startup_mode is not None:
             return startup_mode
+        print("Pilihan tidak valid.", flush=True)
+
+
+def _prompt_post_target_refill_symbol(startup_mode: str) -> str:
+    """Prompt target refill setelah progress swap tercapai."""
+    if startup_mode in {"refill_cc", "check_accounts"}:
+        return "CC"
+    if not sys.stdin.isatty():
+        return "CC"
+
+    print("\nPilih target refill setelah progress swap tercapai:", flush=True)
+    print("1. Mode Refill ke CC", flush=True)
+    print("2. Mode Refill ke USDCx", flush=True)
+
+    while True:
+        print("Masukkan pilihan (1/2): ", end="", flush=True)
+        try:
+            answer = input().strip()
+        except EOFError:
+            print("", flush=True)
+            return "CC"
+        target = POST_TARGET_REFILL_CHOICES.get(answer)
+        if target is not None:
+            return target
         print("Pilihan tidak valid.", flush=True)
 
 
@@ -149,10 +178,23 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["swap_only", "free_only", "free_then_swap", "refill_cc", "check_accounts"],
         help="Override startup mode. Jika tidak diset, akan ditanya interaktif.",
     )
+    parser.add_argument(
+        "--post-target-refill",
+        default=None,
+        choices=["CC", "USDCx"],
+        help="Target refill setelah progress swap tercapai (CC atau USDCx). Default: CC.",
+    )
     return parser
 
 
-async def _run(config_path: str, interrupt_controller: InterruptController, *, cli_strategy: str | None = None, cli_mode: str | None = None) -> int:
+async def _run(
+    config_path: str,
+    interrupt_controller: InterruptController,
+    *,
+    cli_strategy: str | None = None,
+    cli_mode: str | None = None,
+    cli_post_target_refill: str | None = None,
+) -> int:
     repo_root = Path(__file__).resolve().parents[2]
     load_dotenv_file(repo_root / ".env")
     config = load_config(config_path)
@@ -170,6 +212,7 @@ async def _run(config_path: str, interrupt_controller: InterruptController, *, c
     startup_mode = cli_mode
     if startup_mode is None:
         startup_mode = _prompt_startup_mode()
+    post_target_refill_symbol = cli_post_target_refill or _prompt_post_target_refill_symbol(startup_mode)
 
     if startup_mode == "estimate_cc":
         print(render_required_cc_report(config), flush=True)
@@ -180,7 +223,12 @@ async def _run(config_path: str, interrupt_controller: InterruptController, *, c
         use_utc=True,
         terminal_dashboard_enabled=config.runtime.terminal_dashboard_enabled,
     )
-    bot = AutoswapBot(config, repo_root=repo_root, startup_mode=startup_mode)
+    bot = AutoswapBot(
+        config,
+        repo_root=repo_root,
+        startup_mode=startup_mode,
+        post_target_refill_symbol=post_target_refill_symbol,
+    )
     interrupt_controller.attach_bot(bot)
     results = await bot.run()
     print(summarize_results(results))
@@ -196,6 +244,7 @@ def main() -> int:
         cli_strategy = STRATEGY_CHOICES.get(args.strategy)
 
     cli_mode: str | None = args.mode
+    cli_post_target_refill: str | None = args.post_target_refill
 
     interrupt_controller = InterruptController()
     loop = asyncio.new_event_loop()
@@ -204,7 +253,15 @@ def main() -> int:
     signal.signal(signal.SIGINT, lambda *_: interrupt_controller.handle_sigint())
     try:
         asyncio.set_event_loop(loop)
-        return loop.run_until_complete(_run(args.config, interrupt_controller, cli_strategy=cli_strategy, cli_mode=cli_mode))
+        return loop.run_until_complete(
+            _run(
+                args.config,
+                interrupt_controller,
+                cli_strategy=cli_strategy,
+                cli_mode=cli_mode,
+                cli_post_target_refill=cli_post_target_refill,
+            )
+        )
     finally:
         signal.signal(signal.SIGINT, previous_sigint)
         pending = [task for task in asyncio.all_tasks(loop) if not task.done()]

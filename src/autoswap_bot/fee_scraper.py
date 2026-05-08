@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
 
-import httpx
+import httpx  # type: ignore[import]
 
 
 # --- Constants ---
