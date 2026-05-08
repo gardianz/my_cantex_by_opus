@@ -437,7 +437,9 @@ Target refill setelah progress tercapai:
   - Setelah quota round tercapai, bot convert semua token non-CC ke `CC`
   - Rumus `CyLoss` harian dihitung sebagai `CC awal hari - CC setelah refill`
 - `Refill ke USDCx`
-  - Setelah quota round tercapai, bot convert semua token selain `USDCx` (`CC`, `CBTC`) ke `USDCx`
+  - Setelah quota round tercapai, bot hanya convert sisa saldo non-CC selain `USDCx` ke `USDCx`
+  - Contoh Strategi 4: `CC -> USDCx`, lalu bolak-balik `USDCx <-> CBTC`; jika target selesai dan masih ada `CBTC`, bot hanya convert `CBTC -> USDCx`
+  - Saldo `CC` tidak ikut dikonversi ke `USDCx`
   - Tetap mematuhi fee cap dan tetap scrape ccview setelah refill
   - `CyLoss` berbasis saldo CC hanya dihitung saat target akhir adalah `CC`
 

@@ -2572,6 +2572,10 @@ class AutoswapBot:
         for symbol in TRACKED_SYMBOLS:
             if symbol == target_symbol:
                 continue
+            # Untuk target USDCx setelah quota tercapai, hanya rapikan sisa token non-CC
+            # (contoh CBTC -> USDCx). Saldo CC tidak boleh ikut dikonversi.
+            if target_symbol == "USDCx" and symbol == CC_SYMBOL:
+                continue
             amount = balances.get(symbol, Decimal("0"))
             if amount > dust_for_symbol(symbol):
                 remaining[symbol] = amount
@@ -2770,6 +2774,7 @@ class AutoswapBot:
                 monitor_card=monitor_card,
                 used_network_fee=used_network_fee,
                 used_swap_fee=used_swap_fee,
+                source_symbols=tuple(remaining.keys()),
             )
             total_tx += recovered_tx
             if recovered_tx <= 0:
@@ -4247,11 +4252,12 @@ class AutoswapBot:
         monitor_card: TelegramCardState | None,
         used_network_fee: defaultdict[str, Decimal],
         used_swap_fee: defaultdict[str, Decimal],
+        source_symbols: tuple[str, ...] | None = None,
     ) -> int:
         total_tx = 0
         info = await sdk.get_account_info()
         balances = self._balances_by_symbol(info)
-        for source_symbol in self._recovery_source_order(target_symbol):
+        for source_symbol in (source_symbols or self._recovery_source_order(target_symbol)):
             available_amount = self._spendable_amount(
                 source_symbol,
                 balances.get(source_symbol, Decimal("0")),
