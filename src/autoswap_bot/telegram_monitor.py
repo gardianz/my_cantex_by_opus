@@ -130,6 +130,13 @@ class TelegramRateLimitError(RuntimeError):
         self.description = description
 
 
+@dataclass(frozen=True)
+class TelegramCommand:
+    message_id: int
+    chat_id: str
+    text: str
+
+
 class TelegramMonitor:
     def __init__(self, runtime: RuntimeConfig) -> None:
         self.runtime = runtime
@@ -149,6 +156,7 @@ class TelegramMonitor:
         self._telegram_message_id: int | None = None
         self._telegram_last_render_text: str | None = None
         self._telegram_last_publish_monotonic: float = 0.0
+        self._telegram_update_offset: int | None = None
         self._publish_lock = asyncio.Lock()
 
     async def start(self) -> None:
@@ -167,6 +175,83 @@ class TelegramMonitor:
         self._terminal_dashboard_paused = paused
         if not paused:
             self._render_terminal_dashboard(force=True)
+
+    async def poll_commands(self, *, timeout_seconds: int = 0) -> list[TelegramCommand]:
+        if not self.runtime.telegram_enabled:
+            return []
+        if self._session is None:
+            raise RuntimeError("TelegramMonitor belum di-start")
+
+        payload: dict[str, object] = {
+            "timeout": max(int(timeout_seconds), 0),
+            "allowed_updates": ["message"],
+        }
+        if self._telegram_update_offset is not None:
+            payload["offset"] = self._telegram_update_offset
+
+        try:
+            data = await self._request("getUpdates", payload)
+        except Exception as exc:  # pragma: no cover - network/runtime guard
+            self.log.warning("Gagal polling command Telegram: %s", exc)
+            return []
+
+        commands: list[TelegramCommand] = []
+        expected_chat_id = str(self.runtime.telegram_chat_id)
+        for update in data.get("result", []):
+            try:
+                update_id = int(update["update_id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            self._telegram_update_offset = update_id + 1
+
+            message = update.get("message") or {}
+            chat = message.get("chat") or {}
+            chat_id = str(chat.get("id", ""))
+            text = str(message.get("text") or "").strip()
+            if not text or chat_id != expected_chat_id:
+                continue
+            try:
+                message_id = int(message.get("message_id", 0))
+            except (TypeError, ValueError):
+                message_id = 0
+            commands.append(
+                TelegramCommand(
+                    message_id=message_id,
+                    chat_id=chat_id,
+                    text=text,
+                )
+            )
+        return commands
+
+    async def send_command_reply(
+        self,
+        text: str,
+        *,
+        reply_to_message_id: int | None = None,
+    ) -> None:
+        if not self.runtime.telegram_enabled:
+            return
+        if self._session is None:
+            raise RuntimeError("TelegramMonitor belum di-start")
+        payload: dict[str, object] = {
+            "chat_id": self.runtime.telegram_chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
+        if reply_to_message_id:
+            payload["reply_to_message_id"] = reply_to_message_id
+            payload["allow_sending_without_reply"] = True
+        try:
+            await self._request("sendMessage", payload)
+        except TelegramRateLimitError as exc:
+            self.log.warning(
+                "Telegram rate limit saat kirim balasan command, retry_after=%s: %s",
+                exc.retry_after_seconds,
+                exc.description,
+            )
+        except Exception as exc:  # pragma: no cover - network/runtime guard
+            self.log.warning("Gagal kirim balasan command Telegram: %s", exc)
 
     async def _refresh_outputs(self, card: TelegramCardState, *, force: bool) -> None:
         self._cards[card.account_name] = card

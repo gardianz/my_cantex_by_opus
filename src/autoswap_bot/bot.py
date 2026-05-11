@@ -33,7 +33,7 @@ from .runtime_state import BotRuntimeStateStore, DailyFreeFeeStatus
 from .sdk_ext import ExtendedCantexSDK
 from .cycle_tracker import CycleTracker, CycleResult
 from .fee_scraper import FeeScraper
-from .telegram_monitor import TelegramCardState, TelegramMonitor
+from .telegram_monitor import TelegramCardState, TelegramCommand, TelegramMonitor
 
 
 class AccountLoggerAdapter(logging.LoggerAdapter):
@@ -112,9 +112,13 @@ class AutoswapBot:
             logging.getLogger("autoswap_bot.state"),
         )
         self._stop_requested = asyncio.Event()
+        self._telegram_pause_requested = asyncio.Event()
         self._cycle_trackers: dict[str, CycleTracker] = {}
         self.fee_scraper = FeeScraper()
         self._account_party_ids: dict[str, str] = {}  # account_name -> party_id
+        self._active_route_optimizers: set[RouteOptimizer] = set()
+        self._telegram_command_task: asyncio.Task | None = None
+        self._telegram_command_active = False
 
     def _get_cycle_tracker(self, account_name: str) -> CycleTracker:
         """Get or create a CycleTracker for the given account."""
@@ -125,11 +129,266 @@ class AutoswapBot:
     async def request_stop(self) -> None:
         self._stop_requested.set()
 
+    async def request_pause(self) -> None:
+        self._telegram_pause_requested.set()
+
     def stop_requested(self) -> bool:
-        return self._stop_requested.is_set()
+        return self._stop_requested.is_set() or self._telegram_pause_requested.is_set()
+
+    async def request_start(self) -> None:
+        self._telegram_pause_requested.clear()
+
+    async def _start_telegram_command_loop(self) -> None:
+        if not self.config.runtime.telegram_enabled:
+            return
+        if self._telegram_command_task is not None and not self._telegram_command_task.done():
+            return
+        self._telegram_command_active = True
+        self._telegram_command_task = asyncio.create_task(
+            self._telegram_command_loop(),
+            name="telegram-command-loop",
+        )
+        self._telegram_command_task.add_done_callback(self._log_telegram_command_loop_failure)
+
+    async def _stop_telegram_command_loop(self) -> None:
+        self._telegram_command_active = False
+        task = self._telegram_command_task
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        self._telegram_command_task = None
+
+    def _log_telegram_command_loop_failure(self, task: asyncio.Task) -> None:
+        if task.cancelled():
+            return
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            return
+        if exc is not None:
+            self.log.warning("Telegram command loop berhenti: %s", exc)
+
+    async def _telegram_command_loop(self) -> None:
+        while self._telegram_command_active:
+            commands = await self.monitor.poll_commands(timeout_seconds=0)
+            for command in commands:
+                await self._handle_telegram_command(command)
+            await self._sleep_for_telegram_command_loop(2.0)
+
+    async def _sleep_for_telegram_command_loop(self, seconds: float) -> None:
+        try:
+            await asyncio.sleep(seconds)
+        except asyncio.CancelledError:
+            raise
+
+    async def _handle_telegram_command(self, command: TelegramCommand) -> None:
+        text = command.text.strip()
+        command_name, _, rest = text.partition(" ")
+        command_name = command_name.split("@", 1)[0].lower()
+        args = rest.strip()
+
+        if command_name in {"/help", "/menu"}:
+            reply = self._telegram_help_text()
+        elif command_name in {"/status", "/config"}:
+            reply = self._telegram_config_text()
+        elif command_name == "/startbot":
+            await self.request_start()
+            reply = "✅ Bot dilanjutkan. Command /startbot hanya melanjutkan loop yang sedang sleep/paused, bukan restart proses yang sudah selesai."
+        elif command_name == "/stopbot":
+            await self.request_pause()
+            reply = "⏸️ Stop/pause diminta. Bot akan berhenti sementara di titik sleep/poll berikutnya dan bisa dilanjutkan dengan /startbot."
+        elif command_name == "/set":
+            reply = await self._handle_telegram_set_command(args)
+        else:
+            reply = "Command tidak dikenal. Kirim /help untuk daftar command."
+
+        await self.monitor.send_command_reply(
+            reply,
+            reply_to_message_id=command.message_id,
+        )
+
+    def _telegram_help_text(self) -> str:
+        return "\n".join(
+            [
+                "<b>Command Cantex Autoswap</b>",
+                "/status atau /config - lihat status dan config runtime",
+                "/stopbot - pause/stop aman bot",
+                "/startbot - lanjutkan bot jika sedang stop/sleep",
+                "/set max_network_fee_cc_per_execution 0.36",
+                "/set fee_fast_poll_range 0.30 0.40",
+                "/set network_fee_poll_seconds 5 10",
+                "/set rounds 26",
+                "/set rounds 24 28",
+                "",
+                "Catatan: perubahan berlaku runtime dan tidak menulis ulang file config.",
+            ]
+        )
+
+    def _telegram_config_text(self) -> str:
+        runtime = self.config.runtime
+        fee_cap = runtime.max_network_fee_cc_per_execution
+        fast_range = runtime.fee_fast_poll_range
+        poll_range = runtime.network_fee_poll_seconds_range
+        if self._stop_requested.is_set():
+            status = "STOPPING"
+        elif self._telegram_pause_requested.is_set():
+            status = "PAUSED"
+        else:
+            status = "RUNNING"
+        account_rounds = ", ".join(
+            f"{account.name}={account.rounds_range.min_value}..{account.rounds_range.max_value}"
+            for account in self.config.accounts
+        )
+        return "\n".join(
+            [
+                "<b>Status Bot</b>",
+                f"State: {status}",
+                f"max_network_fee_cc_per_execution: {fee_cap if fee_cap is not None else '-'}",
+                (
+                    "fee_fast_poll_range: "
+                    f"{fast_range[0]}..{fast_range[1]}"
+                    if fast_range is not None
+                    else "fee_fast_poll_range: -"
+                ),
+                f"network_fee_poll_seconds: {poll_range.min_value}..{poll_range.max_value}",
+                f"rounds: {account_rounds}",
+            ]
+        )
+
+    async def _handle_telegram_set_command(self, args: str) -> str:
+        if not args:
+            return "Format: /set key value. Kirim /help untuk contoh."
+        parts = args.split()
+        key = parts[0].strip().lower()
+        values = parts[1:]
+        try:
+            if key == "max_network_fee_cc_per_execution":
+                return self._telegram_set_max_network_fee(values)
+            if key == "fee_fast_poll_range":
+                return self._telegram_set_fee_fast_poll_range(values)
+            if key == "network_fee_poll_seconds":
+                return self._telegram_set_network_fee_poll_seconds(values)
+            if key == "rounds":
+                return self._telegram_set_rounds(values)
+        except (ArithmeticError, ValueError) as exc:
+            return f"❌ {exc}"
+        return "❌ Key tidak didukung. Key: max_network_fee_cc_per_execution, fee_fast_poll_range, network_fee_poll_seconds, rounds."
+
+    def _telegram_set_max_network_fee(self, values: list[str]) -> str:
+        if len(values) != 1:
+            raise ValueError("Format: /set max_network_fee_cc_per_execution angka|none")
+        value = values[0].strip().lower()
+        if value in {"none", "off", "null", "-"}:
+            object.__setattr__(self.config.runtime, "max_network_fee_cc_per_execution", None)
+            self._sync_route_optimizer_fee_cap(None)
+            return "✅ max_network_fee_cc_per_execution dinonaktifkan."
+        parsed = Decimal(value)
+        if parsed <= 0:
+            raise ValueError("max_network_fee_cc_per_execution harus > 0")
+        object.__setattr__(self.config.runtime, "max_network_fee_cc_per_execution", parsed)
+        self._sync_route_optimizer_fee_cap(parsed)
+        return f"✅ max_network_fee_cc_per_execution = {parsed} CC"
+
+    def _sync_route_optimizer_fee_cap(self, value: Decimal | None) -> None:
+        for router in list(self._active_route_optimizers):
+            router.set_max_network_fee_cc(value)
+
+    def _telegram_set_fee_fast_poll_range(self, values: list[str]) -> str:
+        if len(values) == 1 and values[0].strip().lower() in {"none", "off", "null", "-"}:
+            object.__setattr__(self.config.runtime, "fee_fast_poll_range", None)
+            return "✅ fee_fast_poll_range dinonaktifkan."
+        min_value, max_value = self._parse_telegram_decimal_range(
+            values,
+            "fee_fast_poll_range",
+        )
+        object.__setattr__(self.config.runtime, "fee_fast_poll_range", (min_value, max_value))
+        return f"✅ fee_fast_poll_range = {min_value}..{max_value} CC"
+
+    def _telegram_set_network_fee_poll_seconds(self, values: list[str]) -> str:
+        min_value, max_value = self._parse_telegram_float_range(
+            values,
+            "network_fee_poll_seconds",
+        )
+        range_type = type(self.config.runtime.network_fee_poll_seconds_range)
+        object.__setattr__(
+            self.config.runtime,
+            "network_fee_poll_seconds_range",
+            range_type(min_value=min_value, max_value=max_value),
+        )
+        return f"✅ network_fee_poll_seconds = {min_value}..{max_value} detik"
+
+    def _telegram_set_rounds(self, values: list[str]) -> str:
+        min_value, max_value = self._parse_telegram_int_range(values, "rounds")
+        for account in self.config.accounts:
+            range_type = type(account.rounds_range)
+            object.__setattr__(
+                account,
+                "rounds_range",
+                range_type(min_value=min_value, max_value=max_value),
+            )
+        return f"✅ rounds semua akun = {min_value}..{max_value}. Berlaku untuk sesi baru/perhitungan berikutnya."
+
+    def _parse_telegram_decimal_range(
+        self,
+        values: list[str],
+        field_name: str,
+    ) -> tuple[Decimal, Decimal]:
+        if len(values) == 1:
+            min_value = max_value = Decimal(values[0])
+        elif len(values) == 2:
+            min_value = Decimal(values[0])
+            max_value = Decimal(values[1])
+        else:
+            raise ValueError(f"Format: /set {field_name} min max")
+        if min_value <= 0 or max_value <= 0:
+            raise ValueError(f"{field_name} harus > 0")
+        if min_value > max_value:
+            raise ValueError(f"{field_name}.min tidak boleh lebih besar dari .max")
+        return min_value, max_value
+
+    def _parse_telegram_float_range(
+        self,
+        values: list[str],
+        field_name: str,
+    ) -> tuple[float, float]:
+        if len(values) == 1:
+            min_value = max_value = float(values[0])
+        elif len(values) == 2:
+            min_value = float(values[0])
+            max_value = float(values[1])
+        else:
+            raise ValueError(f"Format: /set {field_name} min max")
+        if min_value <= 0 or max_value <= 0:
+            raise ValueError(f"{field_name} harus > 0")
+        if min_value > max_value:
+            raise ValueError(f"{field_name}.min tidak boleh lebih besar dari .max")
+        return min_value, max_value
+
+    def _parse_telegram_int_range(
+        self,
+        values: list[str],
+        field_name: str,
+    ) -> tuple[int, int]:
+        if len(values) == 1:
+            min_value = max_value = int(values[0])
+        elif len(values) == 2:
+            min_value = int(values[0])
+            max_value = int(values[1])
+        else:
+            raise ValueError(f"Format: /set {field_name} min max")
+        if min_value < 1 or max_value < 1:
+            raise ValueError(f"{field_name} minimal 1")
+        if min_value > max_value:
+            raise ValueError(f"{field_name}.min tidak boleh lebih besar dari .max")
+        return min_value, max_value
 
     async def run(self) -> list[AccountResult]:
         await self.monitor.start()
+        await self._start_telegram_command_loop()
         try:
             if self._startup_mode_is_check_accounts():
                 await self._run_check_accounts()
@@ -148,6 +407,7 @@ class AutoswapBot:
                 *(self._run_account(account) for account in self.config.accounts)
             )
         finally:
+            await self._stop_telegram_command_loop()
             await self.fee_scraper.close()
             await self.monitor.close()
 
@@ -158,6 +418,7 @@ class AutoswapBot:
 
         while True:
             self._raise_if_stop_requested()
+            await self._pause_if_requested()
             session_number += 1
             last_result = await self._run_account_session(
                 account=account,
@@ -318,6 +579,7 @@ class AutoswapBot:
                     instruments_by_symbol,
                     max_network_fee_cc=self.config.runtime.max_network_fee_cc_per_execution,
                 )
+                self._active_route_optimizers.add(router)
 
                 logger.info(
                     "Strategi=%s | putaran=%s | nominal-range=%s | delay-range=%s | startup-mode=%s | seed=%s",
@@ -399,6 +661,36 @@ class AutoswapBot:
                 used_network_fee: defaultdict[str, Decimal] = defaultdict(Decimal)
                 used_swap_fee: defaultdict[str, Decimal] = defaultdict(Decimal)
                 strategy_state = StrategyRuntimeState()
+                await self._maybe_pre_refill_usdcx_v2(
+                    sdk=sdk,
+                    router=router,
+                    account=account,
+                    prepared_run=prepared_run,
+                    logger=logger,
+                    monitor_card=monitor_card,
+                    used_network_fee=used_network_fee,
+                    used_swap_fee=used_swap_fee,
+                    result=result,
+                )
+                if result.completed_rounds >= prepared_run.rounds and not self._startup_mode_is_refill_cc():
+                    await self._refill_after_target(
+                        sdk=sdk,
+                        router=router,
+                        account=account,
+                        logger=logger,
+                        monitor_card=monitor_card,
+                        used_network_fee=used_network_fee,
+                        used_swap_fee=used_swap_fee,
+                        result=result,
+                    )
+                    await self._wait_until_next_utc_day_after_quota(
+                        sdk=sdk,
+                        account=account,
+                        prepared_run=prepared_run,
+                        result=result,
+                        logger=logger,
+                        monitor_card=monitor_card,
+                    )
                 if self._startup_mode_is_refill_cc():
                     await self._perform_weekly_refill_to_cc(
                         sdk=sdk,
@@ -593,6 +885,9 @@ class AutoswapBot:
                 force=True,
             )
             await self.monitor.finalize(monitor_card, phase="FAILED")
+        finally:
+            if "router" in locals():
+                self._active_route_optimizers.discard(router)
 
         return result
 
@@ -2449,6 +2744,7 @@ class AutoswapBot:
 
         for poll_index in range(max_polls):
             self._raise_if_stop_requested()
+            await self._pause_if_requested()
             info = await sdk.get_account_info()
             balances = self._balances_by_symbol(info)
             previous_amount = previous_balances.get(target_symbol, Decimal("0"))
@@ -2712,6 +3008,105 @@ class AutoswapBot:
                 force=True,
             )
 
+    async def _maybe_pre_refill_usdcx_v2(
+        self,
+        *,
+        sdk: ExtendedCantexSDK,
+        router: RouteOptimizer,
+        account: AccountConfig,
+        prepared_run: PreparedAccountRun,
+        logger: AccountLoggerAdapter,
+        monitor_card: TelegramCardState | None,
+        used_network_fee: defaultdict[str, Decimal],
+        used_swap_fee: defaultdict[str, Decimal],
+        result: AccountResult,
+    ) -> int:
+        if not self._post_target_refill_is_usdcx_v2():
+            return 0
+        if self._startup_mode_is_refill_cc() or self._startup_mode_is_check_accounts():
+            return 0
+        if result.completed_rounds != 0 or prepared_run.rounds <= 0:
+            return 0
+
+        balances = self._balances_by_symbol(await sdk.get_account_info())
+        await self.monitor.update_balances(monitor_card, balances, force=True)
+        remaining = self._non_cc_balances_remaining(balances)
+        if not remaining:
+            return 0
+
+        logger.info(
+            "Refill USDCx v2 pre-step: progress=0 dan saldo non-CC=%s, swap semua ke CC",
+            self._format_amount_map(remaining),
+        )
+        await self.monitor.update_status(
+            monitor_card,
+            round_number=1,
+            phase="PROCESSING",
+            clear_route=True,
+            force=True,
+        )
+        await self.monitor.log_event(
+            monitor_card,
+            f"USDCx v2 pre-refill: converting {self._format_amount_map(remaining)} to CC",
+            force=True,
+        )
+
+        recovered_tx = await self._recover_to_symbol(
+            sdk=sdk,
+            router=router,
+            target_symbol=CC_SYMBOL,
+            cc_reserve=Decimal("0"),
+            logger=logger,
+            monitor_card=monitor_card,
+            used_network_fee=used_network_fee,
+            used_swap_fee=used_swap_fee,
+            source_symbols=tuple(remaining.keys()),
+        )
+        if recovered_tx <= 0:
+            logger.info("Refill USDCx v2 pre-step dilewati: tidak ada swap non-CC->CC yang berhasil")
+            await self.monitor.log_event(
+                monitor_card,
+                "USDCx v2 pre-refill skipped: non-CC->CC not executed",
+                force=True,
+            )
+            return 0
+
+        counted_rounds = min(recovered_tx, max(prepared_run.rounds - result.completed_rounds, 0))
+        for _ in range(counted_rounds):
+            await self.monitor.record_round_completed(
+                monitor_card,
+                pair_key=self._monitor_pair_key("non-CC->CC"),
+                force=True,
+            )
+        if counted_rounds > 0:
+            result.completed_rounds += counted_rounds
+            result.swap_transactions = result.completed_rounds
+            self._persist_round_session_progress(
+                account=account,
+                prepared_run=prepared_run,
+                result=result,
+            )
+            await self.monitor.sync_round_progress(
+                monitor_card,
+                completed_rounds=result.completed_rounds,
+                force=True,
+            )
+            self._schedule_ccview_scrape_after_progress(
+                account_name=account.name,
+                completed_round=result.completed_rounds,
+                monitor_card=monitor_card,
+                reason="usdcx_v2_pre_refill",
+            )
+
+        latest_balances = self._balances_by_symbol(await sdk.get_account_info())
+        await self.monitor.update_balances(monitor_card, latest_balances, force=True)
+        await self.monitor.log_event(
+            monitor_card,
+            f"✅ USDCx v2 pre-refill counted as progress: {result.completed_rounds}/{prepared_run.rounds}",
+            force=True,
+        )
+        return recovered_tx
+
     async def _refill_after_target(
         self,
         *,
@@ -2730,7 +3125,7 @@ class AutoswapBot:
         token lain ke target pilihan agar saldo bersih untuk hari berikutnya.
         MEMATUHI fee cap — tunggu fee turun sebelum refill.
         """
-        target_symbol = self.post_target_refill_symbol
+        target_symbol = self._effective_post_target_refill_symbol()
         balances = self._balances_by_symbol(await sdk.get_account_info())
         remaining = self._non_target_balances_remaining(balances, target_symbol)
         if not remaining:
@@ -2760,6 +3155,7 @@ class AutoswapBot:
         max_iterations = 10  # safety limit (lebih banyak karena mungkin perlu tunggu fee)
         for iteration in range(max_iterations):
             self._raise_if_stop_requested()
+            await self._pause_if_requested()
             balances = self._balances_by_symbol(await sdk.get_account_info())
             remaining = self._non_target_balances_remaining(balances, target_symbol)
             if not remaining:
@@ -3031,6 +3427,7 @@ class AutoswapBot:
         last_balances = previous_balances
         for poll_index in range(max_polls):
             self._raise_if_stop_requested()
+            await self._pause_if_requested()
             info = await sdk.get_account_info()
             balances = self._balances_by_symbol(info)
             last_balances = balances
@@ -3220,6 +3617,7 @@ class AutoswapBot:
             )
         try:
             self._raise_if_stop_requested()
+            await self._pause_if_requested()
             fee_cap = self.config.runtime.max_network_fee_cc_per_execution
             effective_preflight_fee = (
                 hop.network_fee_amount
@@ -3334,6 +3732,11 @@ class AutoswapBot:
                 sell_amount=hop.sell_amount,
                 sell_instrument=hop.raw_quote.sell_instrument,
                 buy_instrument=hop.raw_quote.buy_instrument,
+                max_network_fee=(
+                    fee_cap
+                    if fee_cap is not None and not allow_network_fee_cap_bypass
+                    else None
+                ),
                 timeout=confirm_timeout,
             )
 
@@ -3464,6 +3867,7 @@ class AutoswapBot:
 
         while True:
             self._raise_if_stop_requested()
+            await self._pause_if_requested()
             violating_hop = self._first_network_fee_cap_violation(
                 route,
                 fee_cap=fee_cap,
@@ -3627,6 +4031,7 @@ class AutoswapBot:
             # --- Per-account polling: sleep then re-quote ---
             await self._sleep_or_stop(poll_sleep)
             self._raise_if_stop_requested()
+            await self._pause_if_requested()
 
             # Check deadline after sleep
             now_utc = datetime.now(timezone.utc)
@@ -3811,6 +4216,7 @@ class AutoswapBot:
 
         while True:
             self._raise_if_stop_requested()
+            await self._pause_if_requested()
             if issue is None:
                 route, issue, _ = await self._wait_for_network_fee_below_cap(
                     sdk=sdk,
@@ -4479,6 +4885,7 @@ class AutoswapBot:
 
         while result.completed_rounds < prepared_run.rounds:
             self._raise_if_stop_requested()
+            await self._pause_if_requested()
 
             # === Proactive daily reset: cek apakah hari UTC sudah berganti ===
             was_reset, _session_utc_date = await self._check_and_reset_daily_progress(
@@ -4517,6 +4924,17 @@ class AutoswapBot:
             self._persist_round_session_progress(
                 account=account,
                 prepared_run=prepared_run,
+                result=result,
+            )
+            await self._maybe_pre_refill_usdcx_v2(
+                sdk=sdk,
+                router=router,
+                account=account,
+                prepared_run=prepared_run,
+                logger=logger,
+                monitor_card=monitor_card,
+                used_network_fee=used_network_fee,
+                used_swap_fee=used_swap_fee,
                 result=result,
             )
             if self._weekly_stop_due_utc():
@@ -4690,8 +5108,25 @@ class AutoswapBot:
         session_end_utc: datetime,
         schedule: tuple[ScheduledRound, ...],
     ) -> None:
+        session_utc_date = datetime.now(timezone.utc).date().isoformat()
         for scheduled_round in schedule:
             self._raise_if_stop_requested()
+            await self._pause_if_requested()
+            was_reset, session_utc_date = await self._check_and_reset_daily_progress(
+                account=account,
+                prepared_run=prepared_run,
+                result=result,
+                monitor_card=monitor_card,
+                logger=logger,
+                session_utc_date=session_utc_date,
+            )
+            if was_reset:
+                logger.info(
+                    "Daily reset terjadi di awal scheduled loop | progress sekarang=%s/%s",
+                    result.completed_rounds,
+                    prepared_run.rounds,
+                )
+                return
             if self._weekly_stop_due_utc():
                 await self._perform_weekly_stop(
                     logger=logger,
@@ -4713,6 +5148,17 @@ class AutoswapBot:
             self._persist_round_session_progress(
                 account=account,
                 prepared_run=prepared_run,
+                result=result,
+            )
+            await self._maybe_pre_refill_usdcx_v2(
+                sdk=sdk,
+                router=router,
+                account=account,
+                prepared_run=prepared_run,
+                logger=logger,
+                monitor_card=monitor_card,
+                used_network_fee=used_network_fee,
+                used_swap_fee=used_swap_fee,
                 result=result,
             )
             if self._weekly_stop_due_utc():
@@ -4779,6 +5225,21 @@ class AutoswapBot:
                     f"⏳ Next swap in {int(wait_seconds)}s",
                 )
                 await self._sleep_or_stop(wait_seconds)
+                was_reset, session_utc_date = await self._check_and_reset_daily_progress(
+                    account=account,
+                    prepared_run=prepared_run,
+                    result=result,
+                    monitor_card=monitor_card,
+                    logger=logger,
+                    session_utc_date=session_utc_date,
+                )
+                if was_reset:
+                    logger.info(
+                        "Daily reset terjadi setelah wait scheduled round | progress sekarang=%s/%s",
+                        result.completed_rounds,
+                        prepared_run.rounds,
+                    )
+                    return
                 if self._weekly_stop_due_utc():
                     await self._perform_weekly_stop(
                         logger=logger,
@@ -4972,10 +5433,9 @@ class AutoswapBot:
             )
             return
 
-        # Hitung waktu sampai midnight UTC
         now_utc = datetime.now(timezone.utc)
         next_midnight_utc = self._next_utc_midnight(now_utc)
-        wait_seconds = max(1.0, (next_midnight_utc - now_utc).total_seconds())
+        wait_seconds = max(0.0, (next_midnight_utc - now_utc).total_seconds())
 
         logger.info(
             "Quota harian tercapai (%s/%s) | Menunggu sampai %s UTC (%.0f detik)",
@@ -4995,17 +5455,15 @@ class AutoswapBot:
         await self.monitor.log_event(
             monitor_card,
             (
-                f"🌙 Daily quota reached ({result.completed_rounds}/{prepared_run.rounds}), "
+                f"Daily quota reached ({result.completed_rounds}/{prepared_run.rounds}), "
                 f"sleeping until {self._format_utc(next_midnight_utc)} UTC"
             ),
             force=True,
         )
 
-        # Sleep sampai midnight — cek weekly stop setiap 60 detik
-        sleep_chunk = 60.0
-        remaining = wait_seconds
-        while remaining > 0:
+        while True:
             self._raise_if_stop_requested()
+            await self._pause_if_requested()
             if self._weekly_stop_due_utc():
                 logger.info("Weekly stop jatuh tempo saat menunggu midnight")
                 await self.monitor.log_event(
@@ -5014,12 +5472,12 @@ class AutoswapBot:
                     force=True,
                 )
                 return
-            chunk = min(sleep_chunk, remaining)
-            await self._sleep_or_stop(chunk)
-            remaining -= chunk
+            remaining = (next_midnight_utc - datetime.now(timezone.utc)).total_seconds()
+            if remaining <= 0:
+                break
+            await self._sleep_or_stop(min(5.0, remaining))
 
-        # Setelah midnight — reset progress langsung
-        logger.info("🌅 UTC midnight tercapai — reset daily progress")
+        logger.info("UTC midnight tercapai - reset daily progress")
         self._reset_result_round_progress_for_new_activity_window(
             account=account,
             prepared_run=prepared_run,
@@ -5275,6 +5733,14 @@ class AutoswapBot:
 
     def _startup_mode_is_check_accounts(self) -> bool:
         return self.startup_mode == "check_accounts"
+
+    def _post_target_refill_is_usdcx_v2(self) -> bool:
+        return self.post_target_refill_symbol == "USDCx_v2"
+
+    def _effective_post_target_refill_symbol(self) -> str:
+        if self._post_target_refill_is_usdcx_v2():
+            return "USDCx"
+        return self.post_target_refill_symbol
 
     async def _run_check_accounts(self) -> None:
         """Mode cek akun: auth semua akun, ambil data, render dashboard 1x, kirim Telegram, berhenti."""
@@ -5567,10 +6033,12 @@ class AutoswapBot:
 
             # Jika sync gagal (None) dan tidak butuh increment, return langsung
             if synced_completed_rounds is None and not require_increment:
+                fallback = max(min(previous_completed_rounds, prepared_run.rounds), 0)
                 logger.info(
-                    "Trading history sync gagal/kosong, lanjut dengan progress=0 (tidak menunggu)",
+                    "Trading history sync gagal/kosong, lanjut dengan progress=%s (tidak menunggu)",
+                    fallback,
                 )
-                return 0
+                return fallback
 
             # Jika sudah melebihi max polls, return best known value
             poll_count += 1
@@ -5673,7 +6141,10 @@ class AutoswapBot:
             ok_tx_count=effective_history_count,
             force=force_log,
         )
-        synced_completed_rounds = min(max(effective_history_count, 0), prepared_run.rounds)
+        synced_completed_rounds = min(
+            max(effective_history_count, fallback_completed_rounds, 0),
+            prepared_run.rounds,
+        )
         self.runtime_state.update_round_session_progress(
             account.name,
             strategy_name=prepared_run.strategy_name,
@@ -5712,16 +6183,39 @@ class AutoswapBot:
     async def _sleep_or_stop(self, seconds: float) -> None:
         if seconds <= 0:
             self._raise_if_stop_requested()
+            await self._pause_if_requested()
             return
+        sleep_task = asyncio.create_task(asyncio.sleep(seconds))
+        stop_task = asyncio.create_task(self._stop_requested.wait())
+        pause_task = asyncio.create_task(self._telegram_pause_requested.wait())
         try:
-            await asyncio.wait_for(self._stop_requested.wait(), timeout=seconds)
-        except asyncio.TimeoutError:
-            return
-        raise StopRequested()
+            done, pending = await asyncio.wait(
+                {sleep_task, stop_task, pause_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in pending:
+                task.cancel()
+            if sleep_task in done:
+                return
+            await self._wait_until_started()
+        finally:
+            for task in (sleep_task, stop_task, pause_task):
+                if not task.done():
+                    task.cancel()
 
     def _raise_if_stop_requested(self) -> None:
-        if self.stop_requested():
+        if self._stop_requested.is_set():
             raise StopRequested()
+
+    async def _pause_if_requested(self) -> None:
+        if self._telegram_pause_requested.is_set():
+            await self._wait_until_started()
+
+    async def _wait_until_started(self) -> None:
+        while self._telegram_pause_requested.is_set():
+            if self._stop_requested.is_set():
+                raise StopRequested()
+            await asyncio.sleep(1.0)
 
     def _persist_round_session_progress(
         self,

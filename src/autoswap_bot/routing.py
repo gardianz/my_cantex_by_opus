@@ -22,6 +22,9 @@ class RouteOptimizer:
         self._instruments_by_symbol = instruments_by_symbol
         self._max_network_fee_cc = max_network_fee_cc
 
+    def set_max_network_fee_cc(self, value: Decimal | None) -> None:
+        self._max_network_fee_cc = value
+
     async def choose_best_route(
         self,
         sell_symbol: str,

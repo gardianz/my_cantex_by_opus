@@ -110,17 +110,19 @@ class ExtendedCantexSDK(CantexSDK):
         sell_instrument: InstrumentId,
         buy_instrument: InstrumentId,
         *,
+        max_network_fee: Decimal | None = None,
         timeout: float = 60.0,
     ) -> Any:
         base_method = getattr(super(), "swap_and_confirm", None)
         if not callable(base_method):
             raise RuntimeError(
-                "cantex_sdk 4.0 tidak termuat dengan benar; method swap_and_confirm tidak tersedia"
+                "cantex_sdk terbaru tidak termuat dengan benar; method swap_and_confirm tidak tersedia"
             )
         return await base_method(
             sell_amount=sell_amount,
             sell_instrument=sell_instrument,
             buy_instrument=buy_instrument,
+            max_network_fee=max_network_fee,
             timeout=timeout,
         )
 

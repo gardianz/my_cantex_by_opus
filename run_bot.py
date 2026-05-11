@@ -8,7 +8,7 @@ ROOT = Path(__file__).resolve().parent
 for candidate in reversed(
     (
         ROOT / "src",
-        ROOT / "cantex_sdk-4.0" / "src",
+        ROOT / "cantex_sdk" / "src",
     )
 ):
     candidate_str = str(candidate)

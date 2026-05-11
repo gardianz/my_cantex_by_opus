@@ -31,6 +31,7 @@ STARTUP_MODE_CHOICES = {
 POST_TARGET_REFILL_CHOICES = {
     "1": "CC",
     "2": "USDCx",
+    "3": "USDCx_v2",
 }
 
 
@@ -99,9 +100,10 @@ def _prompt_post_target_refill_symbol(startup_mode: str) -> str:
     print("\nPilih target refill setelah progress swap tercapai:", flush=True)
     print("1. Mode Refill ke CC", flush=True)
     print("2. Mode Refill ke USDCx", flush=True)
+    print("3. Mode Refill ke USDCx v2", flush=True)
 
     while True:
-        print("Masukkan pilihan (1/2): ", end="", flush=True)
+        print("Masukkan pilihan (1/2/3): ", end="", flush=True)
         try:
             answer = input().strip()
         except EOFError:
@@ -181,8 +183,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--post-target-refill",
         default=None,
-        choices=["CC", "USDCx"],
-        help="Target refill setelah progress swap tercapai (CC atau USDCx). Default: CC.",
+        choices=["CC", "USDCx", "USDCx_v2"],
+        help="Target refill setelah progress swap tercapai (CC, USDCx, atau USDCx_v2). Default: CC.",
     )
     return parser
 

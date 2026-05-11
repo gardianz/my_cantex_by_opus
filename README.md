@@ -1,6 +1,6 @@
 # Cantex Autoswap Bot
 
-Bot autoswap multi-account untuk Cantex yang dibangun di atas SDK lokal pada `cantex_sdk-4.0`.
+Bot autoswap multi-account untuk Cantex yang dibangun di atas SDK lokal pada `cantex_sdk`.
 
 ## Ringkasan
 
@@ -15,9 +15,10 @@ Fitur utama:
 - Bot selalu berjalan dalam mode 24 jam berbasis UTC
 - Saat start bot selalu meminta pilihan mode startup `1-6`
 - Monitor Telegram gabungan dalam 1 pesan
+- Kontrol Telegram untuk `/status`, `/config`, `/set`, `/stopbot`, dan `/startbot`
 - Dashboard terminal live berbentuk tabel per account
 - Best-effort fetch activity user dari endpoint web Cantex
-- Konfirmasi swap via WebSocket (`swap_and_confirm`) dari SDK 4.0
+- Konfirmasi swap via WebSocket (`swap_and_confirm`) dari SDK terbaru
 
 ## Struktur File Penting
 
@@ -212,6 +213,33 @@ auto_create_intent_account = true
 
 - `telegram_chat_id`
   - Disarankan diisi lewat `.env` dengan `env:TELEGRAM_CHAT_ID`
+
+## Kontrol Bot lewat Telegram
+
+Jika `telegram_enabled = true`, bot juga membaca command dari chat id yang sama dengan `telegram_chat_id`.
+
+Command yang tersedia:
+
+- `/status` atau `/config`
+  - Menampilkan status runtime dan nilai config yang bisa diubah.
+- `/stopbot`
+  - Pause/stop aman. Bot akan berhenti sementara pada titik sleep/poll berikutnya, bukan mematikan proses secara paksa.
+- `/startbot`
+  - Melanjutkan bot yang sedang pause.
+- `/set max_network_fee_cc_per_execution 0.36`
+  - Mengubah batas network fee per eksekusi dalam `CC`.
+  - Gunakan `none` untuk menonaktifkan batas: `/set max_network_fee_cc_per_execution none`.
+- `/set fee_fast_poll_range 0.30 0.40`
+  - Mengubah range fee yang memakai polling cepat.
+  - Gunakan `none` untuk menonaktifkan: `/set fee_fast_poll_range none`.
+- `/set network_fee_poll_seconds 5 10`
+  - Mengubah interval polling fee menjadi range 5 sampai 10 detik.
+- `/set rounds 26`
+  - Mengubah target rounds semua akun menjadi nilai tetap.
+- `/set rounds 24 28`
+  - Mengubah target rounds semua akun menjadi range.
+
+Catatan: perubahan dari Telegram berlaku untuk runtime proses yang sedang berjalan dan tidak menulis ulang `config/accounts.toml`.
 
 - `terminal_dashboard_enabled`
   - Jika `true` dan bot dijalankan di terminal interaktif, output console akan berubah menjadi dashboard tabel live per account
