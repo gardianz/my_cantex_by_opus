@@ -121,10 +121,51 @@ class AutoswapBot:
         self._telegram_command_active = False
 
     def _get_cycle_tracker(self, account_name: str) -> CycleTracker:
-        """Get or create a CycleTracker for the given account."""
+        """Get or create a CycleTracker for the given account.
+
+        Loads persisted state if available and mode matches.
+        """
         if account_name not in self._cycle_trackers:
-            self._cycle_trackers[account_name] = CycleTracker()
+            # Determine mode from post_target_refill_symbol
+            mode = self.post_target_refill_symbol
+            if mode in ("USDCx", "USDCx_v2"):
+                mode = "USDCx"
+            else:
+                mode = "CC"
+
+            # Create tracker with mode
+            tracker = CycleTracker(mode=mode)
+
+            # Load persisted state if available
+            try:
+                persisted_state = self.runtime_state.get_cycle_state(account_name)
+                tracker.restore_from_state(persisted_state)
+            except Exception as exc:
+                logger.debug("No persisted cycle state for %s: %s", account_name, exc)
+
+            self._cycle_trackers[account_name] = tracker
+
         return self._cycle_trackers[account_name]
+
+    def _save_cycle_tracker_state(self, account_name: str) -> None:
+        """Save cycle tracker state to runtime_state."""
+        tracker = self._cycle_trackers.get(account_name)
+        if tracker is None:
+            return
+        try:
+            state = tracker.get_state_for_persistence()
+            self.runtime_state.save_cycle_state(
+                account_name,
+                cycle_loss_cc=state["cycle_loss_cc"],
+                cycle_loss_usdcx=state["cycle_loss_usdcx"],
+                cycle_count=state["cycle_count"],
+                cycle_mode=state["cycle_mode"],
+                cycle_pending_type=state["cycle_pending_type"],
+                cycle_pending_amount=state["cycle_pending_amount"],
+                cycle_pending_target=state["cycle_pending_target"],
+            )
+        except Exception as exc:
+            logger.warning("Failed to save cycle state for %s: %s", account_name, exc)
 
     async def request_stop(self) -> None:
         self._stop_requested.set()
@@ -2087,6 +2128,8 @@ class AutoswapBot:
                         f"loss={cycle_result.spread_loss}"
                     ),
                 )
+                # Save cycle state after completion for persistence across restarts
+                self._save_cycle_tracker_state(account.name)
             # Trigger ccview.io fee scrape after each successful hop (non-blocking)
             self._trigger_fee_scrape_if_available(
                 account_name=account.name,
@@ -2631,6 +2674,8 @@ class AutoswapBot:
                         f"loss={cycle_result.spread_loss}"
                     ),
                 )
+                # Save cycle state after completion for persistence across restarts
+                self._save_cycle_tracker_state(account.name)
             # Trigger ccview.io fee scrape after each successful hop (non-blocking)
             self._trigger_fee_scrape_if_available(
                 account_name=account.name,

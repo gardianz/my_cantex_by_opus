@@ -23,6 +23,14 @@ class AccountRuntimeState:
     active_updated_at_utc: str = ""
     trading_history_utc_date: str = ""
     trading_history_update_ids: list[str] = field(default_factory=list)
+    # Cycle loss tracking (persisted across restarts, reset daily)
+    cycle_loss_cc: str = "0"
+    cycle_loss_usdcx: str = "0"
+    cycle_count: int = 0
+    cycle_mode: str = ""  # "CC", "USDCx", or "USDCx_v2"
+    cycle_pending_type: str = ""  # "cc" or "usdcx"
+    cycle_pending_amount: str = "0"
+    cycle_pending_target: str = ""
 
 
 @dataclass(frozen=True)
@@ -265,6 +273,57 @@ class BotRuntimeStateStore:
         self._accounts[account_name] = state
         self._save()
 
+    def get_cycle_state(
+        self,
+        account_name: str,
+        *,
+        now_utc: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Get cycle tracker state for persistence."""
+        self._load()
+        normalized_now = self._normalize_now(now_utc)
+        state = self._normalized_state(account_name, normalized_now, persist=False)
+        return {
+            "cycle_loss_cc": state.cycle_loss_cc,
+            "cycle_loss_usdcx": state.cycle_loss_usdcx,
+            "cycle_count": state.cycle_count,
+            "cycle_mode": state.cycle_mode,
+            "cycle_pending_type": state.cycle_pending_type,
+            "cycle_pending_amount": state.cycle_pending_amount,
+            "cycle_pending_target": state.cycle_pending_target,
+        }
+
+    def save_cycle_state(
+        self,
+        account_name: str,
+        *,
+        cycle_loss_cc: str,
+        cycle_loss_usdcx: str,
+        cycle_count: int,
+        cycle_mode: str,
+        cycle_pending_type: str,
+        cycle_pending_amount: str,
+        cycle_pending_target: str,
+        now_utc: datetime | None = None,
+    ) -> None:
+        """Save cycle tracker state to runtime state."""
+        self._load()
+        normalized_now = self._normalize_now(now_utc)
+        state = self._normalized_state(account_name, normalized_now, persist=False)
+        today = normalized_now.date().isoformat()
+
+        # Only save if same day (otherwise state was reset)
+        if state.current_utc_date == today:
+            state.cycle_loss_cc = cycle_loss_cc
+            state.cycle_loss_usdcx = cycle_loss_usdcx
+            state.cycle_count = cycle_count
+            state.cycle_mode = cycle_mode
+            state.cycle_pending_type = cycle_pending_type
+            state.cycle_pending_amount = cycle_pending_amount
+            state.cycle_pending_target = cycle_pending_target
+            self._accounts[account_name] = state
+            self._save()
+
     def _normalize_now(self, now_utc: datetime | None) -> datetime:
         return (now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc)
 
@@ -293,7 +352,7 @@ class BotRuntimeStateStore:
                 active_strategy_name=str(payload.get("active_strategy_name", "")),
                 active_round_utc_date=str(payload.get("active_round_utc_date", "")),
                 active_requested_rounds=max(int(payload.get("active_requested_rounds", 0)), 0),
-                active_completed_rounds=max(int(payload.get("active_completed_rounds", 0)), 0),
+                active_completed_rounds=min(max(int(payload.get("active_completed_rounds", 0)), 0), max(int(payload.get("active_requested_rounds", 0)), 0)),
                 active_updated_at_utc=str(payload.get("active_updated_at_utc", "")),
                 trading_history_utc_date=str(payload.get("trading_history_utc_date", "")),
                 trading_history_update_ids=[
@@ -301,6 +360,14 @@ class BotRuntimeStateStore:
                     for update_id in payload.get("trading_history_update_ids", [])
                     if str(update_id).strip()
                 ],
+                # Cycle loss fields
+                cycle_loss_cc=str(payload.get("cycle_loss_cc", "0")),
+                cycle_loss_usdcx=str(payload.get("cycle_loss_usdcx", "0")),
+                cycle_count=int(payload.get("cycle_count", 0)),
+                cycle_mode=str(payload.get("cycle_mode", "")),
+                cycle_pending_type=str(payload.get("cycle_pending_type", "")),
+                cycle_pending_amount=str(payload.get("cycle_pending_amount", "0")),
+                cycle_pending_target=str(payload.get("cycle_pending_target", "")),
             )
 
     def _normalized_state(
@@ -323,6 +390,14 @@ class BotRuntimeStateStore:
                 active_updated_at_utc="",
                 trading_history_utc_date=today,
                 trading_history_update_ids=[],
+                # Reset cycle loss daily
+                cycle_loss_cc="0",
+                cycle_loss_usdcx="0",
+                cycle_count=0,
+                cycle_mode="",
+                cycle_pending_type="",
+                cycle_pending_amount="0",
+                cycle_pending_target="",
             )
             self._accounts[account_name] = state
             if persist:
@@ -347,6 +422,14 @@ class BotRuntimeStateStore:
                     "active_updated_at_utc": state.active_updated_at_utc,
                     "trading_history_utc_date": state.trading_history_utc_date,
                     "trading_history_update_ids": state.trading_history_update_ids,
+                    # Cycle loss fields
+                    "cycle_loss_cc": state.cycle_loss_cc,
+                    "cycle_loss_usdcx": state.cycle_loss_usdcx,
+                    "cycle_count": state.cycle_count,
+                    "cycle_mode": state.cycle_mode,
+                    "cycle_pending_type": state.cycle_pending_type,
+                    "cycle_pending_amount": state.cycle_pending_amount,
+                    "cycle_pending_target": state.cycle_pending_target,
                 }
                 for account_name, state in sorted(self._accounts.items())
             },
