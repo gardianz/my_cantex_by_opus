@@ -1774,6 +1774,23 @@ class CantexSDK:
         """
         ws = await self._ws_connect("/v1/ws/private", authenticated=True)
         try:
+            def _instrument_matches(actual: InstrumentId, expected: InstrumentId) -> bool:
+                if actual.id != expected.id:
+                    return False
+                if actual.admin and expected.admin and actual.admin != expected.admin:
+                    return False
+                return True
+
+            def _matches_requested_swap(event: WsEvent) -> bool:
+                event_input = getattr(event, "input_instrument", None)
+                event_output = getattr(event, "output_instrument", None)
+                if event_input is None or event_output is None:
+                    return False
+                return (
+                    _instrument_matches(event_input, sell_instrument)
+                    and _instrument_matches(event_output, buy_instrument)
+                )
+
             logger.info(
                 "Intent swap: %s %s -> %s",
                 sell_amount, sell_instrument.id, buy_instrument.id,
@@ -1796,9 +1813,23 @@ class CantexSDK:
             async def _wait_for_confirmation() -> SwapExecutedEvent:
                 async for event in ws:
                     if isinstance(event, SwapPendingEvent):
+                        if not _matches_requested_swap(event):
+                            logger.debug(
+                                "Ignoring unrelated swap pending event: %s -> %s",
+                                event.input_instrument.id,
+                                event.output_instrument.id,
+                            )
+                            continue
                         logger.info("Swap pending (id=%s)", event.swap_id)
                         continue
                     if isinstance(event, SwapExecutedEvent):
+                        if not _matches_requested_swap(event):
+                            logger.debug(
+                                "Ignoring unrelated swap executed event: %s %s -> %s %s",
+                                event.input_amount, event.input_instrument.id,
+                                event.output_amount, event.output_instrument.id,
+                            )
+                            continue
                         logger.info(
                             "Swap confirmed: %s %s -> %s %s",
                             event.input_amount, event.input_instrument.id,
@@ -1806,6 +1837,13 @@ class CantexSDK:
                         )
                         return event
                     if isinstance(event, SwapFailedEvent):
+                        if not _matches_requested_swap(event):
+                            logger.debug(
+                                "Ignoring unrelated swap failed event: %s -> %s",
+                                event.input_instrument.id,
+                                event.output_instrument.id,
+                            )
+                            continue
                         raise CantexError(f"Swap failed: {event.error}")
                 raise CantexError("WebSocket closed before swap confirmation")
 

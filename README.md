@@ -123,6 +123,7 @@ Struktur dasarnya:
 [settings]
 swap_delay_seconds = { min = 20.0, max = 100.0 }
 max_network_fee_cc_per_execution = "0.12"
+max_slippage_per_execution = "0.001"
 network_fee_poll_seconds = { min = 20.0, max = 40.0 }
 full_24h_auto_restart = true
 weekly_stop_on_monday_utc = true
@@ -175,6 +176,12 @@ auto_create_intent_account = true
     - jika nilai setting `0.12`
     - lalu quote menunjukkan network fee `0.15 CC`
     - maka bot tidak swap, tetapi menunggu dan cek ulang
+
+- `max_slippage_per_execution`
+  - Batas maksimum slippage quote untuk setiap hop swap
+  - Nilainya mengikuti format mentah dari SDK `quote.prices.slippage`
+  - Contoh `0.001` berarti `0.1%`
+  - Jika quote awal atau re-quote sebelum submit melebihi batas ini, hop dibatalkan agar tidak dieksekusi pada slippage terlalu tinggi
 
 - `network_fee_poll_seconds`
   - Interval tunggu antar pengecekan ulang fee saat fee masih di atas batas
@@ -482,6 +489,7 @@ Perilaku umum mode 24 jam:
 - jatah `3x free fee swap` harian per account akan reset saat hari UTC berganti, tetapi baru boleh dipakai mulai `01:00 UTC`
 - jadi bot tidak akan memakai free swap tepat setelah `00:00 UTC`, melainkan menunggu `+1 jam`
 - `max_network_fee_cc_per_execution` berlaku untuk semua swap normal, recovery, refill, dan hop lanjutan
+- `max_slippage_per_execution` juga dicek untuk semua hop swap normal, recovery, refill, dan hop lanjutan
 - pengecualian hanya untuk hop free swap yang benar-benar memakai jatah harian
 - jika fee terlalu tinggi, bot akan retry quote pada slot round itu
 - jika saat menunggu fee turun muncul quote error sementara seperti `HTTP 502`, bot tetap hidup dan akan mencoba quote ulang lagi

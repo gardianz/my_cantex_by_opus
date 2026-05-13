@@ -1956,6 +1956,38 @@ class TestSwapAndConfirm:
             assert isinstance(result, SwapExecutedEvent)
         await authed_sdk.close()
 
+    async def test_ignores_unrelated_swap_events(self, authed_sdk):
+        """Unrelated swap events should not satisfy the confirmation wait."""
+        unrelated_executed_raw = {
+            **SAMPLE_WS_SWAP_EXECUTED_RAW,
+            "data": {
+                **SAMPLE_WS_SWAP_EXECUTED_RAW["data"],
+                "swap_details": {
+                    **SAMPLE_WS_SWAP_EXECUTED_RAW["data"]["swap_details"],
+                    "output_amount": "109.7721936059",
+                    "output_instrument_id": {"admin": "CC::1220ghi", "id": "CC"},
+                },
+            },
+        }
+        mock_ws = _mock_raw_ws([
+            _make_ws_msg(aiohttp.WSMsgType.TEXT, json.dumps(unrelated_executed_raw)),
+            _make_ws_msg(aiohttp.WSMsgType.TEXT, json.dumps(SAMPLE_WS_SWAP_EXECUTED_RAW)),
+        ])
+        with aioresponses() as m, patch.object(
+            aiohttp.ClientSession, "ws_connect",
+            new_callable=AsyncMock, return_value=mock_ws,
+        ):
+            _intent_build_submit_mocks(m)
+            result = await authed_sdk.swap_and_confirm(
+                sell_amount=Decimal("11"),
+                sell_instrument=InstrumentId(id="USDCx", admin="usdc-rep::1220abc"),
+                buy_instrument=InstrumentId(id="Amulet", admin="DSO::1220def"),
+            )
+            assert isinstance(result, SwapExecutedEvent)
+            assert result.output_instrument.id == "Amulet"
+            assert result.output_amount == Decimal("74.8590517011")
+        await authed_sdk.close()
+
     async def test_ws_closed_before_confirmation(self, authed_sdk):
         """WS closing before any swap event raises CantexError."""
         mock_ws = _mock_raw_ws([

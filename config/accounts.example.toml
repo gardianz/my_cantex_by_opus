@@ -9,6 +9,7 @@ swap_delay_seconds = { min = 1.0, max = 1.0 }
 
 # Fee control
 max_network_fee_cc_per_execution = "0.36"    # Max fee per swap (CC)
+max_slippage_per_execution = "0.001"         # Max slippage per hop (0.001 = 0.1%)
 fee_stability_enabled = true                  # Cek rata-rata N quote sebelum swap
 fee_stability_samples = 3                     # Jumlah quote untuk rata-rata
 fee_fast_poll_range = { min = "0.30", max = "0.40" }  # Fee dalam range ini → poll 1 detik

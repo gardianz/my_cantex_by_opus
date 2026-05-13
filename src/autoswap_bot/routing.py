@@ -17,13 +17,18 @@ class RouteOptimizer:
         instruments_by_symbol: dict[str, InstrumentId],
         *,
         max_network_fee_cc: Decimal | None = None,
+        max_slippage: Decimal | None = None,
     ) -> None:
         self._sdk = sdk
         self._instruments_by_symbol = instruments_by_symbol
         self._max_network_fee_cc = max_network_fee_cc
+        self._max_slippage = max_slippage
 
     def set_max_network_fee_cc(self, value: Decimal | None) -> None:
         self._max_network_fee_cc = value
+
+    def set_max_slippage(self, value: Decimal | None) -> None:
+        self._max_slippage = value
 
     async def choose_best_route(
         self,
@@ -37,7 +42,10 @@ class RouteOptimizer:
             direct_result = await self._quote_path(direct_path, sell_amount)
             if {sell_symbol, buy_symbol} == {"USDCx", "CBTC"}:
                 return direct_result
-            if not self._has_network_fee_cap_violation(direct_result):
+            if (
+                not self._has_network_fee_cap_violation(direct_result)
+                and not self._has_slippage_cap_violation(direct_result)
+            ):
                 return direct_result
         except Exception as exc:
             direct_result = exc
@@ -69,7 +77,10 @@ class RouteOptimizer:
         eligible_routes = [
             route
             for route in valid_routes
-            if not self._has_network_fee_cap_violation(route)
+            if (
+                not self._has_network_fee_cap_violation(route)
+                and not self._has_slippage_cap_violation(route)
+            )
         ]
         if eligible_routes:
             return min(
@@ -98,6 +109,11 @@ class RouteOptimizer:
             and hop.network_fee_amount > self._max_network_fee_cc
             for hop in route.hops
         )
+
+    def _has_slippage_cap_violation(self, route: RoutePlan) -> bool:
+        if self._max_slippage is None:
+            return False
+        return any(hop.slippage > self._max_slippage for hop in route.hops)
 
     async def _quote_path(
         self,

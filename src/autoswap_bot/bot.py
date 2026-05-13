@@ -290,6 +290,12 @@ class AutoswapBot:
                 f"State: {status}",
                 f"max_network_fee_cc_per_execution: {fee_cap if fee_cap is not None else '-'}",
                 (
+                    "max_slippage_per_execution: "
+                    f"{runtime.max_slippage_per_execution}"
+                    if runtime.max_slippage_per_execution is not None
+                    else "max_slippage_per_execution: -"
+                ),
+                (
                     "fee_fast_poll_range: "
                     f"{fast_range[0]}..{fast_range[1]}"
                     if fast_range is not None
@@ -619,6 +625,7 @@ class AutoswapBot:
                     sdk,
                     instruments_by_symbol,
                     max_network_fee_cc=self.config.runtime.max_network_fee_cc_per_execution,
+                    max_slippage=self.config.runtime.max_slippage_per_execution,
                 )
                 self._active_route_optimizers.add(router)
 
@@ -2065,8 +2072,20 @@ class AutoswapBot:
                 total_swap_fee=dict(used_swap_fee),
             )
             tx_identifier = tx_result.get("id") or tx_result.get("transactionId") or tx_result.get("contract_id")
-            actual_output_amount = self._parse_decimal_like(tx_result.get("output_amount")) or hop.returned_amount
-            slippage_pct = hop.slippage
+            actual_output_amount, output_warning = self._resolve_actual_output_amount(
+                hop=hop,
+                tx_result=tx_result,
+                balances_before=hop_balances_before,
+                balances_after=settled_balances,
+            )
+            slippage_pct = self._parse_decimal_like(tx_result.get("quote_slippage")) or hop.slippage
+            if output_warning is not None:
+                logger.warning(output_warning)
+                await self.monitor.log_event(
+                    monitor_card,
+                    f"⚠️ {output_warning}",
+                    force=True,
+                )
             logger.info(
                 "Tx hop %s/%s berhasil | %s -> %s | tx=%s | output=%s %s | "
                 "expected=%s | slippage=%s%%",
@@ -2611,8 +2630,20 @@ class AutoswapBot:
                 total_swap_fee=dict(used_swap_fee),
             )
             tx_identifier = tx_result.get("id") or tx_result.get("transactionId") or tx_result.get("contract_id")
-            actual_output_amount = self._parse_decimal_like(tx_result.get("output_amount")) or hop.returned_amount
-            slippage_pct = hop.slippage
+            actual_output_amount, output_warning = self._resolve_actual_output_amount(
+                hop=hop,
+                tx_result=tx_result,
+                balances_before=hop_balances_before,
+                balances_after=settled_balances,
+            )
+            slippage_pct = self._parse_decimal_like(tx_result.get("quote_slippage")) or hop.slippage
+            if output_warning is not None:
+                logger.warning(output_warning)
+                await self.monitor.log_event(
+                    monitor_card,
+                    f"⚠️ {output_warning}",
+                    force=True,
+                )
             logger.info(
                 "Tx hop %s/%s berhasil | %s -> %s | tx=%s | output=%s %s | "
                 "expected=%s | slippage=%s%%",
@@ -3552,7 +3583,10 @@ class AutoswapBot:
                 expected_swap_loss += hop.sell_amount
             if hop.buy_symbol == CC_SYMBOL:
                 # CC yang diterima dari swap mengurangi total loss
-                actual_output = self._parse_decimal_like(tx_result.get("output_amount"))
+                actual_output = self._matching_tx_output_amount(
+                    tx_result=tx_result,
+                    expected_symbol=CC_SYMBOL,
+                )
                 if actual_output is not None and hop.buy_symbol == CC_SYMBOL:
                     expected_swap_loss -= actual_output
                 else:
@@ -3664,6 +3698,7 @@ class AutoswapBot:
             self._raise_if_stop_requested()
             await self._pause_if_requested()
             fee_cap = self.config.runtime.max_network_fee_cc_per_execution
+            slippage_cap = self.config.runtime.max_slippage_per_execution
             effective_preflight_fee = (
                 hop.network_fee_amount
                 if hop.network_fee_symbol == CC_SYMBOL
@@ -3675,18 +3710,19 @@ class AutoswapBot:
                 else "-"
             )
             logger.info(
-                "Swap hop %s/%s round %s memakai SDK swap_and_confirm | fee quote=%s",
+                "Swap hop %s/%s round %s memakai SDK swap_and_confirm | fee quote=%s | slippage quote=%s",
                 hop_index,
                 hop_total,
                 round_number,
                 quote_fee_text,
+                hop.slippage,
             )
             self._schedule_monitor_call(
                 self.monitor.log_event(
                     monitor_card,
                     (
                         f"[preflight] Hop {hop_index}/{hop_total} "
-                        f"quote fee={quote_fee_text}"
+                        f"quote fee={quote_fee_text} | slip={hop.slippage}"
                     ),
                 ),
                 logger=logger,
@@ -3717,12 +3753,35 @@ class AutoswapBot:
                 )
                 return None, "NETWORK_FEE_ABOVE_LIMIT"
 
-            # --- FIX: Re-quote tepat sebelum submit untuk cek fee terkini ---
+            if slippage_cap is not None and hop.slippage > slippage_cap:
+                logger.warning(
+                    "Swap hop %s/%s round %s dibatalkan sebelum submit karena slippage preflight %s > batas %s",
+                    hop_index,
+                    hop_total,
+                    round_number,
+                    hop.slippage,
+                    slippage_cap,
+                )
+                await self.monitor.log_event(
+                    monitor_card,
+                    (
+                        f"🚫 Hop {hop_index}/{hop_total} DIBATALKAN: "
+                        f"preflight slippage {hop.slippage} > limit {slippage_cap}"
+                    ),
+                    force=True,
+                )
+                return None, "SLIPPAGE_ABOVE_LIMIT"
+
+            # Re-quote tepat sebelum submit untuk cek fee/slippage terkini.
             fresh_fee_amount = effective_preflight_fee
+            fresh_slippage = hop.slippage
             if (
-                fee_cap is not None
-                and not allow_network_fee_cap_bypass
-                and hop.network_fee_symbol == CC_SYMBOL
+                (
+                    fee_cap is not None
+                    and not allow_network_fee_cap_bypass
+                    and hop.network_fee_symbol == CC_SYMBOL
+                )
+                or slippage_cap is not None
             ):
                 try:
                     fresh_quote = await sdk.get_swap_quote(
@@ -3730,23 +3789,33 @@ class AutoswapBot:
                         sell_instrument=hop.raw_quote.sell_instrument,
                         buy_instrument=hop.raw_quote.buy_instrument,
                     )
-                    fresh_fee_amount = fresh_quote.fees.network_fee.amount
+                    if hop.network_fee_symbol == CC_SYMBOL:
+                        fresh_fee_amount = fresh_quote.fees.network_fee.amount
+                    fresh_slippage = fresh_quote.prices.slippage
                     logger.info(
-                        "Re-quote sebelum submit hop %s/%s round %s: fee=%s CC (was %s)",
+                        "Re-quote sebelum submit hop %s/%s round %s: fee=%s CC (was %s) | slippage=%s (was %s)",
                         hop_index,
                         hop_total,
                         round_number,
                         fresh_fee_amount,
                         quote_fee_text,
+                        fresh_slippage,
+                        hop.slippage,
                     )
                     await self.monitor.log_event(
                         monitor_card,
                         (
                             f"[re-quote] Hop {hop_index}/{hop_total} "
-                            f"fee={fresh_fee_amount} CC (was {quote_fee_text})"
+                            f"fee={fresh_fee_amount} CC (was {quote_fee_text}) | "
+                            f"slip={fresh_slippage} (was {hop.slippage})"
                         ),
                     )
-                    if fresh_fee_amount > fee_cap:
+                    if (
+                        fee_cap is not None
+                        and not allow_network_fee_cap_bypass
+                        and hop.network_fee_symbol == CC_SYMBOL
+                        and fresh_fee_amount > fee_cap
+                    ):
                         logger.warning(
                             "Swap hop %s/%s round %s DIBATALKAN: re-quote fee %s CC > batas %s CC",
                             hop_index,
@@ -3764,9 +3833,27 @@ class AutoswapBot:
                             force=True,
                         )
                         return None, "NETWORK_FEE_ABOVE_LIMIT"
+                    if slippage_cap is not None and fresh_slippage > slippage_cap:
+                        logger.warning(
+                            "Swap hop %s/%s round %s DIBATALKAN: re-quote slippage %s > batas %s",
+                            hop_index,
+                            hop_total,
+                            round_number,
+                            fresh_slippage,
+                            slippage_cap,
+                        )
+                        await self.monitor.log_event(
+                            monitor_card,
+                            (
+                                f"🚫 Hop {hop_index}/{hop_total} DIBATALKAN: "
+                                f"re-quote slippage {fresh_slippage} > limit {slippage_cap}"
+                            ),
+                            force=True,
+                        )
+                        return None, "SLIPPAGE_ABOVE_LIMIT"
                 except (CantexAPIError, CantexTimeoutError) as re_quote_exc:
                     logger.warning(
-                        "Re-quote gagal untuk hop %s/%s round %s, lanjut dengan fee lama: %s",
+                        "Re-quote gagal untuk hop %s/%s round %s, lanjut dengan quote lama: %s",
                         hop_index,
                         hop_total,
                         round_number,
@@ -3797,6 +3884,7 @@ class AutoswapBot:
                     "liquidity_fee_amount": getattr(event, "liquidity_fee_amount", None),
                     "quote_network_fee_amount": fresh_fee_amount if fresh_fee_amount is not None else hop.network_fee_amount,
                     "quote_network_fee_symbol": hop.network_fee_symbol,
+                    "quote_slippage": fresh_slippage,
                     "raw": getattr(event, "raw", {}),
                 },
                 None,
@@ -6651,6 +6739,57 @@ class AutoswapBot:
             return Decimal(cleaned)
         except Exception:
             return None
+
+    def _tx_output_symbol_matches(self, tx_result: dict[str, Any], expected_symbol: str) -> bool:
+        actual_symbol = str(tx_result.get("output_instrument", "")).strip()
+        if not actual_symbol:
+            return False
+        return actual_symbol.lower() == expected_symbol.strip().lower()
+
+    def _matching_tx_output_amount(
+        self,
+        *,
+        tx_result: dict[str, Any],
+        expected_symbol: str,
+    ) -> Decimal | None:
+        amount = self._parse_decimal_like(tx_result.get("output_amount"))
+        if amount is None:
+            return None
+        if not self._tx_output_symbol_matches(tx_result, expected_symbol):
+            return None
+        return amount
+
+    def _resolve_actual_output_amount(
+        self,
+        *,
+        hop: RouteHop,
+        tx_result: dict[str, Any],
+        balances_before: dict[str, Decimal],
+        balances_after: dict[str, Decimal],
+    ) -> tuple[Decimal, str | None]:
+        matched_event_output = self._matching_tx_output_amount(
+            tx_result=tx_result,
+            expected_symbol=hop.buy_symbol,
+        )
+        if matched_event_output is not None:
+            return matched_event_output, None
+
+        raw_event_output = self._parse_decimal_like(tx_result.get("output_amount"))
+        balance_delta = balances_after.get(hop.buy_symbol, Decimal("0")) - balances_before.get(
+            hop.buy_symbol,
+            Decimal("0"),
+        )
+        if balance_delta > dust_for_symbol(hop.buy_symbol):
+            output_symbol = str(tx_result.get("output_instrument", "")).strip() or "?"
+            warning = None
+            if raw_event_output is not None:
+                warning = (
+                    f"Tx output mismatch {hop.sell_symbol}->{hop.buy_symbol}: "
+                    f"event={output_symbol} {raw_event_output}, balance={balance_delta} {hop.buy_symbol}"
+                )
+            return balance_delta, warning
+
+        return raw_event_output or hop.returned_amount, None
 
     def _is_failed_history_item(self, item: dict[str, Any]) -> bool:
         status_parts = [
