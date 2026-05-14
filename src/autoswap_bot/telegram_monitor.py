@@ -91,6 +91,12 @@ class TelegramCardState:
     fee_quote_history: list[Decimal] = field(default_factory=list)
     total_cycle_spread_loss: dict[str, Decimal] = field(default_factory=dict)
     cycle_count: int = 0
+    # Akumulasi balance delta per swap (metode baru, lebih akurat).
+    # Setiap swap sukses: delta = balance_target_before - balance_target_after.
+    # Positif = saldo target berkurang (rugi), negatif = saldo target bertambah (untung).
+    # Diupdate langsung setelah setiap swap, tidak perlu menunggu cycle close.
+    swap_balance_delta_loss: Decimal = field(default_factory=lambda: Decimal("0"))
+    swap_balance_delta_count: int = 0
     # Daily loss tracking (simple: target_balance_start_of_day - target_balance_after_refill)
     # Bekerja untuk SEMUA target refill: CC, USDCx, USDCx_v2.
     # Field-name tetap pakai prefix "cc_" untuk kompat backward; isinya bisa
@@ -412,6 +418,33 @@ class TelegramMonitor:
         card.total_network_fee = dict(total_network_fee)
         card.total_swap_fee = dict(total_swap_fee)
         self._persist_card_state(card)
+        await self._refresh_outputs(card, force=force)
+
+    async def record_swap_balance_delta(
+        self,
+        card: TelegramCardState | None,
+        *,
+        target_symbol: str,
+        balance_before: Decimal,
+        balance_after: Decimal,
+        force: bool = False,
+    ) -> None:
+        """Akumulasi balance delta per swap untuk CyLoss real-time.
+
+        Dipanggil setelah setiap swap sukses dengan balance snapshot sebelum dan sesudah.
+        delta = balance_before[target] - balance_after[target]
+        Positif = saldo target berkurang (rugi spread/fee).
+        Negatif = saldo target bertambah (swap masuk lebih besar dari keluar).
+        """
+        if card is None:
+            return
+        self._rollover_card_if_needed(card)
+        delta = balance_before - balance_after
+        card.swap_balance_delta_loss += delta
+        card.swap_balance_delta_count += 1
+        # Juga update daily_loss_symbol agar label konsisten
+        if not card.daily_loss_symbol:
+            card.daily_loss_symbol = target_symbol
         await self._refresh_outputs(card, force=force)
 
     async def record_cycle_spread_loss(
@@ -1817,15 +1850,26 @@ class TelegramMonitor:
         return ", ".join(parts) if parts else "-"
 
     def _format_cycle_spread_loss_compact(self, card: TelegramCardState) -> str:
-        """Format daily CC loss for compact display.
+        """Format cycle loss untuk compact display.
 
-        Uses simple formula: CC_start_of_day - CC_after_refill.
-        Falls back to per-cycle tracking if daily loss not yet computed.
+        Prioritas:
+        1. swap_balance_delta_loss: akumulasi delta balance per swap (real-time, paling akurat)
+        2. daily_cc_loss: simple daily loss setelah refill selesai
+        3. total_cycle_spread_loss: per-cycle tracking (legacy fallback)
         """
-        # Prioritize simple daily loss if available (untuk semua target: CC/USDCx)
+        symbol_label = SYMBOL_SHORT.get(card.daily_loss_symbol or "CC", card.daily_loss_symbol or "CC")
+
+        # Prioritas 1: akumulasi balance delta per swap (real-time)
+        if card.swap_balance_delta_count > 0:
+            loss = card.swap_balance_delta_loss
+            rendered = format(loss, ".2f").rstrip("0").rstrip(".")
+            if not rendered or rendered == "-":
+                rendered = "0"
+            return f"{rendered} {symbol_label}"
+
+        # Prioritas 2: simple daily loss setelah refill
         if card.daily_cc_loss_set:
             loss = card.daily_cc_loss
-            symbol_label = SYMBOL_SHORT.get(card.daily_loss_symbol or "CC", card.daily_loss_symbol or "CC")
             if loss == Decimal("0"):
                 return f"0 {symbol_label}"
             rendered = format(loss, ".2f").rstrip("0").rstrip(".")
@@ -2179,6 +2223,9 @@ class TelegramMonitor:
             card.day_session_network_fee_offset = dict(card.total_network_fee)
             card.day_session_free_network_fee_offset = dict(card.free_network_fee_credit)
             card.day_session_swap_fee_offset = dict(card.total_swap_fee)
+            # Reset balance delta loss harian
+            card.swap_balance_delta_loss = Decimal("0")
+            card.swap_balance_delta_count = 0
             changed = True
         if card.current_utc_week != today_week:
             card.current_utc_week = today_week
