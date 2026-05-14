@@ -91,10 +91,14 @@ class TelegramCardState:
     fee_quote_history: list[Decimal] = field(default_factory=list)
     total_cycle_spread_loss: dict[str, Decimal] = field(default_factory=dict)
     cycle_count: int = 0
-    # Daily CC loss tracking (simple: CC_start_of_day - CC_after_refill)
+    # Daily loss tracking (simple: target_balance_start_of_day - target_balance_after_refill)
+    # Bekerja untuk SEMUA target refill: CC, USDCx, USDCx_v2.
+    # Field-name tetap pakai prefix "cc_" untuk kompat backward; isinya bisa
+    # symbol apa saja sesuai post_target_refill_symbol.
     cc_balance_start_of_day: Decimal = field(default_factory=lambda: Decimal("0"))
     daily_cc_loss: Decimal = field(default_factory=lambda: Decimal("0"))
     daily_cc_loss_set: bool = False  # True once loss has been computed after refill
+    daily_loss_symbol: str = "CC"  # symbol yang dipakai untuk daily loss tracking
     # CCView actual fee data (from fee_scraper)
     ccview_validator_fee_total: Decimal = field(default_factory=lambda: Decimal("0"))
     ccview_validator_tx_count: int = 0
@@ -430,27 +434,41 @@ class TelegramMonitor:
         self,
         card: TelegramCardState | None,
         cc_balance: Decimal,
+        *,
+        target_symbol: str = "CC",
     ) -> None:
-        """Set the CC balance at start of day for daily loss calculation."""
+        """Set the start-of-day balance untuk daily loss calculation.
+
+        Default target_symbol="CC" supaya backward-compatible.
+        Untuk target USDCx / USDCx_v2, panggil dengan target_symbol="USDCx".
+        Catatan: nama field tetap `cc_balance_start_of_day` untuk kompat dengan
+        state file lama, isinya menampung balance dari simbol target apa pun.
+        """
         if card is None:
             return
         card.cc_balance_start_of_day = cc_balance
         card.daily_cc_loss = Decimal("0")
         card.daily_cc_loss_set = False
+        card.daily_loss_symbol = target_symbol or "CC"
 
     async def update_daily_cc_loss(
         self,
         card: TelegramCardState | None,
-        cc_balance_after_refill: Decimal,
+        balance_after_refill: Decimal,
         *,
         force: bool = True,
     ) -> None:
-        """Update daily CC loss after refill: loss = CC_start - CC_after_refill."""
+        """Update daily target-symbol loss after refill.
+
+        loss = balance_start_of_day - balance_after_refill (positif = rugi)
+        Symbol yang dipakai untuk perbandingan ditentukan oleh
+        ``card.daily_loss_symbol`` yang di-set saat `set_cc_balance_start_of_day`.
+        """
         if card is None:
             return
         if card.cc_balance_start_of_day <= Decimal("0"):
             return
-        card.daily_cc_loss = card.cc_balance_start_of_day - cc_balance_after_refill
+        card.daily_cc_loss = card.cc_balance_start_of_day - balance_after_refill
         card.daily_cc_loss_set = True
         await self._refresh_outputs(card, force=force)
 
@@ -745,8 +763,10 @@ class TelegramMonitor:
         self._terminal_last_render_monotonic = now
 
     def _dashboard_col_widths(self) -> tuple[int, ...]:
+        # Width per kolom; perlebar untuk akun 10+ karakter, plan, gas, cyloss
+        # supaya nilai tidak terpotong "..." di terminal.
         # #, Akun, St, CC, USDCx, CBTC, Prog, Plan, Fee, Avg, Gas, AvgF, Rew, CyLoss, Dist, Fund, Fr
-        return (2, 8, 3, 6, 5, 10, 5, 16, 5, 5, 8, 5, 6, 10, 6, 5, 3)
+        return (3, 10, 3, 6, 7, 10, 5, 22, 5, 5, 10, 5, 6, 14, 7, 6, 3)
 
     def _dashboard_table_lines(self, cards: list[TelegramCardState]) -> tuple[tuple[int, ...], list[str]]:
         col_widths = self._dashboard_col_widths()
@@ -1290,8 +1310,8 @@ class TelegramMonitor:
         plan = self._combined_plan(card)
         fee_route = self._dashboard_route_fee(card)
         cycle_spread = self._format_cycle_spread_loss_compact(card)
-        cc_balance = self._fmt_balance(card.balances.get("CC", Decimal("0")), 4)
-        usdcx_balance = self._fmt_balance(card.balances.get("USDCx", Decimal("0")), 4)
+        cc_balance = self._fmt_balance(card.balances.get("CC", Decimal("0")), 2)
+        usdcx_balance = self._fmt_balance(card.balances.get("USDCx", Decimal("0")), 2)
         cbtc_balance = self._fmt_balance(card.balances.get("CBTC", Decimal("0")), 8)
         title = (
             f"{self._telegram_status_emoji(card)} {self._display_account_name(card.account_name)} "
@@ -1405,7 +1425,7 @@ class TelegramMonitor:
 
     def _build_balances_line(self, card: TelegramCardState) -> str:
         cc = self._fmt_balance(card.balances.get("CC", Decimal("0")), 2)
-        usdcx = self._fmt_balance(card.balances.get("USDCx", Decimal("0")), 4)
+        usdcx = self._fmt_balance(card.balances.get("USDCx", Decimal("0")), 2)
         cbtc = self._fmt_balance(card.balances.get("CBTC", Decimal("0")), 8)
         return f"💰 Balances: CC {cc} | U {usdcx} | B {cbtc}"
 
@@ -1797,13 +1817,14 @@ class TelegramMonitor:
         Uses simple formula: CC_start_of_day - CC_after_refill.
         Falls back to per-cycle tracking if daily loss not yet computed.
         """
-        # Prioritize simple daily CC loss if available
+        # Prioritize simple daily loss if available (untuk semua target: CC/USDCx)
         if card.daily_cc_loss_set:
             loss = card.daily_cc_loss
+            symbol_label = SYMBOL_SHORT.get(card.daily_loss_symbol or "CC", card.daily_loss_symbol or "CC")
             if loss == Decimal("0"):
-                return "0"
+                return f"0 {symbol_label}"
             rendered = format(loss, ".2f").rstrip("0").rstrip(".")
-            return f"{rendered} CC"
+            return f"{rendered} {symbol_label}"
 
         # Fallback: show per-cycle spread loss (legacy, before first refill)
         values = card.total_cycle_spread_loss

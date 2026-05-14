@@ -31,6 +31,9 @@ class AccountRuntimeState:
     cycle_pending_type: str = ""  # "cc" or "usdcx"
     cycle_pending_amount: str = "0"
     cycle_pending_target: str = ""
+    # USDCx_v2 pre-refill idempotency: tanggal UTC saat pre-refill non-CC->CC
+    # terakhir dijalankan untuk akun ini. Kalau sama dengan hari ini, skip.
+    last_pre_refill_utc_date: str = ""
 
 
 @dataclass(frozen=True)
@@ -324,6 +327,35 @@ class BotRuntimeStateStore:
             self._accounts[account_name] = state
             self._save()
 
+    def is_pre_refill_done_today(
+        self,
+        account_name: str,
+        *,
+        now_utc: datetime | None = None,
+    ) -> bool:
+        """Cek apakah USDCx_v2 pre-refill non-CC->CC sudah dijalankan hari ini."""
+        self._load()
+        normalized_now = self._normalize_now(now_utc)
+        state = self._normalized_state(account_name, normalized_now, persist=False)
+        today = normalized_now.date().isoformat()
+        return state.last_pre_refill_utc_date == today
+
+    def mark_pre_refill_done_today(
+        self,
+        account_name: str,
+        *,
+        now_utc: datetime | None = None,
+    ) -> None:
+        """Tandai pre-refill non-CC->CC sudah selesai hari ini agar tidak dijalankan ulang."""
+        self._load()
+        normalized_now = self._normalize_now(now_utc)
+        state = self._normalized_state(account_name, normalized_now, persist=False)
+        today = normalized_now.date().isoformat()
+        if state.last_pre_refill_utc_date != today:
+            state.last_pre_refill_utc_date = today
+            self._accounts[account_name] = state
+            self._save()
+
     def _normalize_now(self, now_utc: datetime | None) -> datetime:
         return (now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc)
 
@@ -368,6 +400,7 @@ class BotRuntimeStateStore:
                 cycle_pending_type=str(payload.get("cycle_pending_type", "")),
                 cycle_pending_amount=str(payload.get("cycle_pending_amount", "0")),
                 cycle_pending_target=str(payload.get("cycle_pending_target", "")),
+                last_pre_refill_utc_date=str(payload.get("last_pre_refill_utc_date", "")),
             )
 
     def _normalized_state(
@@ -398,6 +431,8 @@ class BotRuntimeStateStore:
                 cycle_pending_type="",
                 cycle_pending_amount="0",
                 cycle_pending_target="",
+                # Reset USDCx_v2 pre-refill flag harian
+                last_pre_refill_utc_date="",
             )
             self._accounts[account_name] = state
             if persist:
@@ -430,6 +465,7 @@ class BotRuntimeStateStore:
                     "cycle_pending_type": state.cycle_pending_type,
                     "cycle_pending_amount": state.cycle_pending_amount,
                     "cycle_pending_target": state.cycle_pending_target,
+                    "last_pre_refill_utc_date": state.last_pre_refill_utc_date,
                 }
                 for account_name, state in sorted(self._accounts.items())
             },

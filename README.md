@@ -26,6 +26,21 @@ Fitur utama:
 - Config utama: `config/accounts.toml`
 - Entry point: `run_bot.py`
 - Core bot: `src/autoswap_bot/bot.py`
+- Dokumentasi developer / maintenance: `AGENTS.md`
+
+## Dokumentasi Pengembangan
+
+Untuk memudahkan pengembangan berikutnya, detail logic penting dan titik extension terbaru sekarang dirangkum di `AGENTS.md`.
+
+Isi utamanya:
+
+- peta file inti bot dan tanggung jawab tiap modul
+- flow cycle tracking untuk mode `CC` dan `USDCx`
+- guard output mismatch antara event SDK vs balance settlement
+- urutan pengecekan `max_network_fee_cc_per_execution` dan `max_slippage_per_execution`
+- panduan verifikasi cepat setelah perubahan kode
+
+Jika ada perubahan perilaku bot ke depan, sebaiknya bagian yang relevan di `README.md` dan `AGENTS.md` diperbarui bersamaan agar konteks engineering tidak hilang.
 
 ## Kebutuhan
 
@@ -251,6 +266,8 @@ Catatan: perubahan dari Telegram berlaku untuk runtime proses yang sedang berjal
 - `terminal_dashboard_enabled`
   - Jika `true` dan bot dijalankan di terminal interaktif, output console akan berubah menjadi dashboard tabel live per account
   - Log mentah biasa disembunyikan agar tampilan tidak campur
+  - Lebar kolom default sekarang lebih luas agar nilai pada `Akun`, `Plan`, `Gas`, `CyLoss`, `Dist`, dan `Fund` tidak terpotong `...`. Pastikan terminal Anda minimal lebar 130 kolom
+  - Saldo `CC` dan `USDCx` di dashboard maupun di Telegram card sekarang ditampilkan dengan 2 desimal (mis. `14.32` / `11.53`); `CBTC` tetap 8 desimal
 
 - `terminal_dashboard_logs_limit`
   - Jumlah log terakhir yang ditampilkan di bagian bawah dashboard terminal
@@ -442,6 +459,7 @@ Setelah memilih mode swap harian (`1`, `2`, atau `3`), bot juga menanyakan targe
 
 1. `Mode Refill ke CC`
 2. `Mode Refill ke USDCx`
+3. `Mode Refill ke USDCx v2`
 
 Arti mode:
 
@@ -476,7 +494,18 @@ Target refill setelah progress tercapai:
   - Contoh Strategi 4: `CC -> USDCx`, lalu bolak-balik `USDCx <-> CBTC`; jika target selesai dan masih ada `CBTC`, bot hanya convert `CBTC -> USDCx`
   - Saldo `CC` tidak ikut dikonversi ke `USDCx`
   - Tetap mematuhi fee cap dan tetap scrape ccview setelah refill
-  - `CyLoss` berbasis saldo CC hanya dihitung saat target akhir adalah `CC`
+- `Refill ke USDCx v2`
+  - Sama dengan mode Refill ke USDCx, namun di awal hari bot melakukan langkah ekstra: convert semua sisa non-CC ke `CC` dulu sebelum mulai loop swap
+  - Tujuan: meratakan modal hari baru ke `CC` agar perhitungan loss & strategi konsisten saat memulai
+  - Pre-refill berjalan dengan idempotency harian (flag persisten `last_pre_refill_utc_date`); maksimum 1x per akun per hari UTC
+  - Pre-refill tidak lagi terikat ke `result.completed_rounds == 0` sehingga konsisten saat reset harian dengan trading history yang sudah maju
+
+`CyLoss` simple sekarang aktif untuk SEMUA target refill:
+
+- target `CC` → `CyLoss = CC_pagi - CC_setelah_refill`, ditampilkan dengan label `CC`
+- target `USDCx` / `USDCx v2` → `CyLoss = USDCx_pagi - USDCx_setelah_refill`, ditampilkan dengan label `U`
+
+Selama `CyLoss` simple belum di-set (mis. sebelum refill akhir hari pertama), kolom menampilkan akumulasi per-cycle dari `cycle_tracker`.
 
 Perilaku umum mode 24 jam:
 
@@ -702,11 +731,19 @@ Kolom `Gas` dashboard memakai total fee validator dari ccview.io untuk tanggal U
 5. Bot retry scrape pada delay 8s, 18s, dan 35s karena ccview.io bisa terlambat meng-index transaksi.
 6. Setelah refill selesai, bot melakukan scrape langsung dan menjadwalkan retry background agar fee refill ikut masuk.
 
+Pembaruan terbaru perilaku scrape ccview:
+
+- Cooldown trigger di-set setelah scrape sukses (bukan saat trigger), sehingga scrape gagal/timeout tidak menelan slot trigger berikutnya. Cooldown juga diturunkan dari 5 detik menjadi 2 detik supaya hop berurutan tetap dilayani.
+- `FeeScraper` sekarang punya callback registry. Bot mendaftarkan callback yang otomatis memanggil `monitor.update_ccview_fee` setiap kali ada hasil scrape sukses, termasuk dari `_periodic_scrape_loop` setiap 90 detik. Sebelumnya periodic loop hanya update `_latest_results` tanpa menyentuh card dashboard.
+- Polling card-update task per-trigger diperpanjang: dari rigid 8 s + 5 s retry (total 13 s) menjadi polling tiap 5 detik sampai dapat data baru atau timeout 60 detik. Snapshot `_last_scrape_time` dan `validator_tx_count` di awal task dipakai untuk membedakan data baru vs lama.
+
 Jika `Gas` masih tidak berubah, cek log berikut:
 
 - `CCView party_id stored` — memastikan party_id tersedia untuk akun.
+- `[GAS DIAG] CCView trigger ACCEPT` / `SKIP cooldown` — menunjukkan keputusan trigger per hop.
+- `[GAS DIAG] CCView background scrape lock waited Xs` — kalau muncul dengan angka tinggi, lock global serialisasi 20 akun sedang antri.
 - `CCView progress scrape applied` — scrape berbasis progress berhasil diterapkan ke dashboard.
-- `CCView progress scrape skipped` — biasanya party_id/card belum tersedia.
-- `CCView progress scrape exception` — error jaringan/API ccview.
+- `CCView card update OK (poll)` — task polling per-trigger berhasil mendeteksi data baru.
+- `CCView card update timed out 60s` — 60 detik tidak ada update; biasanya karena ccview.io memang tidak menyentuh data baru atau lock terlalu lama.
 
 Kolom `Gas` formatnya `total_fee(tx_count)`, contoh `5.59(12)` artinya total validator fee hari ini `5.59 CC` dari `12` transaksi validator.

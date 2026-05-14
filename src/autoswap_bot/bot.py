@@ -116,9 +116,15 @@ class AutoswapBot:
         self._cycle_trackers: dict[str, CycleTracker] = {}
         self.fee_scraper = FeeScraper()
         self._account_party_ids: dict[str, str] = {}  # account_name -> party_id
+        # Map account_name -> TelegramCardState aktif. Dipakai oleh callback
+        # FeeScraper.on_result supaya periodic loop bisa merefresh card.
+        self._monitor_cards_by_account: dict[str, TelegramCardState] = {}
         self._active_route_optimizers: set[RouteOptimizer] = set()
         self._telegram_command_task: asyncio.Task | None = None
         self._telegram_command_active = False
+        # Daftarkan callback ke FeeScraper supaya tiap result.success
+        # otomatis update card via Monitor (background task).
+        self.fee_scraper.register_on_result(self._on_fee_scrape_result)
 
     def _get_cycle_tracker(self, account_name: str) -> CycleTracker:
         """Get or create a CycleTracker for the given account.
@@ -146,6 +152,41 @@ class AutoswapBot:
             self._cycle_trackers[account_name] = tracker
 
         return self._cycle_trackers[account_name]
+
+    def _on_fee_scrape_result(self, account_name: str, result) -> None:
+        """Callback dipanggil FeeScraper saat ada result.success baru.
+
+        Refresh dashboard card untuk akun terkait. Sengaja non-blocking:
+        create background task agar callback tetap sync.
+        """
+        card = self._monitor_cards_by_account.get(account_name)
+        if card is None:
+            return
+
+        async def _do_update() -> None:
+            try:
+                await self.monitor.update_ccview_fee(
+                    card,
+                    validator_fee_total=result.validator_fee_total,
+                    validator_tx_count=result.validator_tx_count,
+                    avg_fee_per_swap=result.avg_fee_per_swap,
+                )
+            except Exception as exc:
+                self.log.debug(
+                    "FeeScraper on_result update_ccview_fee gagal | %s | %s",
+                    account_name,
+                    exc,
+                )
+
+        try:
+            task = asyncio.create_task(_do_update())
+            task.add_done_callback(lambda t: None)
+        except RuntimeError:
+            # Tidak ada running loop (mis. saat shutdown). Abaikan.
+            self.log.debug(
+                "FeeScraper on_result skip create_task: tidak ada loop aktif | %s",
+                account_name,
+            )
 
     def _save_cycle_tracker_state(self, account_name: str) -> None:
         """Save cycle tracker state to runtime_state."""
@@ -527,6 +568,10 @@ class AutoswapBot:
             prepared_run,
             account.strategy().label,
         )
+        # Register card supaya FeeScraper.on_result callback bisa
+        # me-refresh dashboard saat periodic / background scrape memberi
+        # hasil baru tanpa harus melewati card-update task per-hop.
+        self._monitor_cards_by_account[account.name] = monitor_card
         self.runtime_state.ensure_account(account.name)
         sdk = self._build_sdk(account)
 
@@ -645,10 +690,21 @@ class AutoswapBot:
                     initial_balances,
                     force=True,
                 )
-                # Record CC balance at start of day for daily loss calculation
-                cc_start = initial_balances.get(CC_SYMBOL, Decimal("0"))
-                await self.monitor.set_cc_balance_start_of_day(monitor_card, cc_start)
-                logger.info("CC balance start of day recorded: %s", cc_start)
+                # Record start-of-day balance untuk daily loss calculation.
+                # Pakai simbol target refill yang efektif (CC / USDCx) supaya
+                # CyLoss bekerja juga saat target = USDCx atau USDCx_v2.
+                loss_target_symbol = self._effective_post_target_refill_symbol()
+                start_balance = initial_balances.get(loss_target_symbol, Decimal("0"))
+                await self.monitor.set_cc_balance_start_of_day(
+                    monitor_card,
+                    start_balance,
+                    target_symbol=loss_target_symbol,
+                )
+                logger.info(
+                    "Daily-loss start balance recorded: %s=%s",
+                    loss_target_symbol,
+                    start_balance,
+                )
                 baseline_activity = await self._fetch_activity_summary(sdk, logger)
                 result.activity_summary = baseline_activity
                 await self.monitor.update_activity(
@@ -2133,6 +2189,20 @@ class AutoswapBot:
                 network_fee=actual_network_fee,
                 swap_fee=actual_swap_fee,
             )
+            # [CYLOSS DIAG] track tiap call ke record_swap dari path utama (_execute_round_dynamic)
+            logger.info(
+                "[CYLOSS DIAG] record_swap (round path) | mode=%s | %s->%s | "
+                "sell=%s buy=%s | result=%s | total_usdcx=%s | total_cc=%s | count=%s",
+                cycle_tracker.mode,
+                hop.sell_symbol,
+                hop.buy_symbol,
+                hop.sell_amount,
+                actual_output_amount,
+                "complete" if cycle_result is not None else "none",
+                cycle_tracker.total_usdcx_spread_loss,
+                cycle_tracker.total_cc_spread_loss,
+                cycle_tracker.cycle_count,
+            )
             if cycle_result is not None:
                 await self.monitor.record_cycle_spread_loss(
                     monitor_card,
@@ -2691,6 +2761,20 @@ class AutoswapBot:
                 network_fee=actual_network_fee,
                 swap_fee=actual_swap_fee,
             )
+            # [CYLOSS DIAG] track tiap call ke record_swap dari path v2 (_execute_round_dynamic_v2)
+            logger.info(
+                "[CYLOSS DIAG] record_swap (round path v2) | mode=%s | %s->%s | "
+                "sell=%s buy=%s | result=%s | total_usdcx=%s | total_cc=%s | count=%s",
+                cycle_tracker.mode,
+                hop.sell_symbol,
+                hop.buy_symbol,
+                hop.sell_amount,
+                actual_output_amount,
+                "complete" if cycle_result is not None else "none",
+                cycle_tracker.total_usdcx_spread_loss,
+                cycle_tracker.total_cc_spread_loss,
+                cycle_tracker.cycle_count,
+            )
             if cycle_result is not None:
                 await self.monitor.record_cycle_spread_loss(
                     monitor_card,
@@ -3097,17 +3181,37 @@ class AutoswapBot:
         used_swap_fee: defaultdict[str, Decimal],
         result: AccountResult,
     ) -> int:
+        # Opsi 1 + Opsi 3 (kombinasi):
+        # - Hapus gate `result.completed_rounds != 0` yang rapuh terhadap race
+        #   dengan trading-history sync setelah daily reset.
+        # - Pakai flag harian persisten `last_pre_refill_utc_date` di runtime_state
+        #   untuk idempotency: pre-refill maksimal 1x per akun per hari UTC.
+        # - Tetap cek balance non-CC > dust supaya tidak swap saat tidak ada sisa.
         if not self._post_target_refill_is_usdcx_v2():
             return 0
         if self._startup_mode_is_refill_cc() or self._startup_mode_is_check_accounts():
             return 0
-        if result.completed_rounds != 0 or prepared_run.rounds <= 0:
+        if prepared_run.rounds <= 0:
+            return 0
+
+        # Idempotency check: kalau sudah dijalankan hari ini, skip diam-diam.
+        if self.runtime_state.is_pre_refill_done_today(account.name):
+            logger.debug(
+                "USDCx v2 pre-refill: sudah dijalankan hari ini untuk %s, skip",
+                account.name,
+            )
             return 0
 
         balances = self._balances_by_symbol(await sdk.get_account_info())
         await self.monitor.update_balances(monitor_card, balances, force=True)
         remaining = self._non_cc_balances_remaining(balances)
         if not remaining:
+            # Tidak ada sisa non-CC; tetap tandai selesai supaya gate harian
+            # konsisten dan tidak dipanggil ulang dari hot-loop hari ini.
+            self.runtime_state.mark_pre_refill_done_today(account.name)
+            logger.info(
+                "USDCx v2 pre-refill: tidak ada sisa non-CC, marker harian dipasang"
+            )
             return 0
 
         logger.info(
@@ -3139,10 +3243,15 @@ class AutoswapBot:
             source_symbols=tuple(remaining.keys()),
         )
         if recovered_tx <= 0:
-            logger.info("Refill USDCx v2 pre-step dilewati: tidak ada swap non-CC->CC yang berhasil")
+            # Catatan: TIDAK mark_pre_refill_done_today di sini supaya bot bisa
+            # retry pada loop berikutnya saat fee/slippage sudah turun.
+            logger.warning(
+                "Refill USDCx v2 pre-step gagal: tidak ada swap non-CC->CC yang berhasil "
+                "(fee/slippage cap mungkin terlampaui), akan dicoba lagi nanti"
+            )
             await self.monitor.log_event(
                 monitor_card,
-                "USDCx v2 pre-refill skipped: non-CC->CC not executed",
+                "⚠️ USDCx v2 pre-refill skipped: non-CC->CC not executed (akan retry)",
                 force=True,
             )
             return 0
@@ -3176,6 +3285,11 @@ class AutoswapBot:
 
         latest_balances = self._balances_by_symbol(await sdk.get_account_info())
         await self.monitor.update_balances(monitor_card, latest_balances, force=True)
+        # Tandai pre-refill harian selesai supaya tidak diulang di hot-loop hari ini.
+        # Note: re-check sisa non-CC dilakukan di luar via balance gate, jadi
+        # kalau swap berikutnya hasilkan saldo non-CC lagi, yang menanganinya
+        # adalah _refill_after_target di akhir hari (target USDCx).
+        self.runtime_state.mark_pre_refill_done_today(account.name)
         await self.monitor.log_event(
             monitor_card,
             f"✅ USDCx v2 pre-refill counted as progress: {result.completed_rounds}/{prepared_run.rounds}",
@@ -3313,20 +3427,31 @@ class AutoswapBot:
             reason="refill",
         )
 
-        # --- After refill: compute daily CC loss only when final target is CC ---
-        if target_symbol == CC_SYMBOL:
-            cc_after_refill = final_balances.get(CC_SYMBOL, Decimal("0"))
-            await self.monitor.update_daily_cc_loss(
-                monitor_card,
-                cc_after_refill,
+        # --- After refill: compute daily loss untuk simbol target apa pun ---
+        # Loss = balance(target)_start_of_day - balance(target)_after_refill.
+        # Bekerja untuk target CC maupun USDCx / USDCx_v2 (target efektif "USDCx").
+        balance_after_refill = final_balances.get(target_symbol, Decimal("0"))
+        # [DIAG] dipertahankan sementara untuk verifikasi visual di log
+        logger.info(
+            "[CYLOSS DIAG] _refill_after_target end | target_symbol=%s | "
+            "start_of_day=%s | after_refill=%s | daily_loss_symbol=%s",
+            target_symbol,
+            monitor_card.cc_balance_start_of_day if monitor_card is not None else "n/a",
+            balance_after_refill,
+            monitor_card.daily_loss_symbol if monitor_card is not None else "n/a",
+        )
+        await self.monitor.update_daily_cc_loss(
+            monitor_card,
+            balance_after_refill,
+        )
+        if monitor_card is not None and monitor_card.cc_balance_start_of_day > Decimal("0"):
+            logger.info(
+                "Daily %s loss: start=%s | after_refill=%s | loss=%s",
+                target_symbol,
+                monitor_card.cc_balance_start_of_day,
+                balance_after_refill,
+                monitor_card.daily_cc_loss,
             )
-            if monitor_card is not None and monitor_card.cc_balance_start_of_day > Decimal("0"):
-                logger.info(
-                    "Daily CC loss: start=%s | after_refill=%s | loss=%s",
-                    monitor_card.cc_balance_start_of_day,
-                    cc_after_refill,
-                    monitor_card.daily_cc_loss,
-                )
 
     def _sample_execution_amount(
         self,
@@ -4519,61 +4644,61 @@ class AutoswapBot:
             completed_round=completed_round,
         )
 
-        # Schedule a delayed update to the monitor card with scrape results
+        # Schedule a polling card update.
+        # Sebagai safety net selain callback `register_on_result` (yang
+        # otomatis refresh card kalau scrape sukses). Polling loop ini
+        # menanggulangi situasi: lock antri panjang, callback gagal, dll.
+        # Loop sampai dapat result baru atau timeout total 60 detik.
         if monitor_card is not None:
             async def _update_card_with_scrape_result() -> None:
-                # Wait for scraper delay (5s) + actual scrape time (~3-5s)
-                # Reduced from 12s to 8s for faster card updates
+                deadline = time.monotonic() + 60.0
+                last_observed_scrape_time: float | None = self.fee_scraper._last_scrape_time.get(
+                    account_name
+                )
+                last_observed_tx: int | None = None
+                cached = self.fee_scraper.get_latest_result(account_name)
+                if cached is not None and cached.success:
+                    last_observed_tx = cached.validator_tx_count
+
+                # Tunggu dulu sekitar indexing delay + slack
                 await asyncio.sleep(8)
-                result = self.fee_scraper.get_latest_result(account_name)
-                if result is not None and result.success:
-                    self.log.info(
-                        "CCView card update OK | %s | fee=%s | tx=%s | avg=%s",
-                        account_name,
-                        result.validator_fee_total,
-                        result.validator_tx_count,
-                        result.avg_fee_per_swap,
-                    )
-                    await self.monitor.update_ccview_fee(
-                        monitor_card,
-                        validator_fee_total=result.validator_fee_total,
-                        validator_tx_count=result.validator_tx_count,
-                        avg_fee_per_swap=result.avg_fee_per_swap,
-                    )
-                elif result is None:
-                    # Result not ready yet — retry once after 5s more
-                    self.log.info(
-                        "CCView card update: result not ready yet for %s, retrying in 5s...",
-                        account_name,
-                    )
-                    await asyncio.sleep(5)
+
+                while time.monotonic() < deadline:
                     result = self.fee_scraper.get_latest_result(account_name)
+                    new_scrape_time = self.fee_scraper._last_scrape_time.get(account_name)
+
                     if result is not None and result.success:
-                        self.log.info(
-                            "CCView card update OK (retry) | %s | fee=%s | tx=%s | avg=%s",
-                            account_name,
-                            result.validator_fee_total,
-                            result.validator_tx_count,
-                            result.avg_fee_per_swap,
+                        # Anggap "data baru" kalau scrape time atau tx count berubah
+                        scrape_advanced = (
+                            last_observed_scrape_time is None
+                            or (new_scrape_time is not None and new_scrape_time > last_observed_scrape_time)
                         )
-                        await self.monitor.update_ccview_fee(
-                            monitor_card,
-                            validator_fee_total=result.validator_fee_total,
-                            validator_tx_count=result.validator_tx_count,
-                            avg_fee_per_swap=result.avg_fee_per_swap,
+                        tx_advanced = (
+                            last_observed_tx is None
+                            or result.validator_tx_count > last_observed_tx
                         )
-                    else:
-                        self.log.warning(
-                            "CCView card update FAILED after retry | %s | result=%s",
-                            account_name,
-                            "no_result" if result is None else f"error:{result.error}",
-                        )
-                else:
-                    self.log.warning(
-                        "CCView card update skipped | %s | scrape_error=%s",
-                        account_name,
-                        result.error,
-                    )
+                        if scrape_advanced or tx_advanced:
+                            self.log.info(
+                                "CCView card update OK (poll) | %s | fee=%s | tx=%s | avg=%s",
+                                account_name,
+                                result.validator_fee_total,
+                                result.validator_tx_count,
+                                result.avg_fee_per_swap,
+                            )
+                            await self.monitor.update_ccview_fee(
+                                monitor_card,
+                                validator_fee_total=result.validator_fee_total,
+                                validator_tx_count=result.validator_tx_count,
+                                avg_fee_per_swap=result.avg_fee_per_swap,
+                            )
+                            return
+
+                    await asyncio.sleep(5)
+
+                self.log.warning(
+                    "CCView card update timed out 60s | %s | menunggu data baru di _latest_results",
+                    account_name,
+                )
 
             task = asyncio.create_task(_update_card_with_scrape_result())
 
@@ -4986,6 +5111,52 @@ class AutoswapBot:
                     monitor_card,
                     f"🛟 Recovery tx {hop.sell_symbol}->{hop.buy_symbol} {tx_identifier or '-'}",
                 )
+                # --- Cycle spread loss tracking utk swap recovery / refill juga ---
+                # Tanpa ini, cycle yang ditutup lewat refill (mis. CBTC->USDCx
+                # saat _refill_after_target) tidak terhitung di total_cycle_spread_loss.
+                actual_recovery_output = self._resolve_actual_output_amount(
+                    hop=hop,
+                    tx_result=tx_result,
+                    balances_before=hop_balances_before,
+                    balances_after=settled_balances,
+                )[0]
+                cycle_tracker = self._get_cycle_tracker(account.name)
+                cycle_result = cycle_tracker.record_swap(
+                    sell_symbol=hop.sell_symbol,
+                    buy_symbol=hop.buy_symbol,
+                    sell_amount=hop.sell_amount,
+                    buy_amount=actual_recovery_output,
+                    network_fee=actual_network_fee,
+                    swap_fee=actual_swap_fee,
+                )
+                logger.info(
+                    "[CYLOSS DIAG] record_swap (recovery path) | mode=%s | %s->%s | "
+                    "sell=%s buy=%s | result=%s | total_usdcx=%s | total_cc=%s | count=%s",
+                    cycle_tracker.mode,
+                    hop.sell_symbol,
+                    hop.buy_symbol,
+                    hop.sell_amount,
+                    actual_recovery_output,
+                    "complete" if cycle_result is not None else "none",
+                    cycle_tracker.total_usdcx_spread_loss,
+                    cycle_tracker.total_cc_spread_loss,
+                    cycle_tracker.cycle_count,
+                )
+                if cycle_result is not None:
+                    await self.monitor.record_cycle_spread_loss(
+                        monitor_card,
+                        cycle_result=cycle_result,
+                    )
+                    await self.monitor.log_event(
+                        monitor_card,
+                        (
+                            f"🔁 Cycle #{cycle_tracker.cycle_count} complete (recovery, "
+                            f"{cycle_result.cycle_type}) | "
+                            f"{cycle_result.origin_symbol}: {cycle_result.start_amount} -> "
+                            f"{cycle_result.end_amount} | loss={cycle_result.spread_loss}"
+                        ),
+                    )
+                    self._save_cycle_tracker_state(account.name)
                 await self._sleep_between_swaps()
             if recovery_failed:
                 continue
@@ -5621,9 +5792,14 @@ class AutoswapBot:
         # Trigger monitor card rollover
         if monitor_card is not None:
             self.monitor._rollover_card_if_needed(monitor_card)
-            # Reset daily CC loss for new day
-            current_cc = monitor_card.balances.get(CC_SYMBOL, Decimal("0"))
-            await self.monitor.set_cc_balance_start_of_day(monitor_card, current_cc)
+            # Reset daily loss tracking utk hari baru — pakai simbol target efektif
+            loss_target_symbol = self._effective_post_target_refill_symbol()
+            current_balance = monitor_card.balances.get(loss_target_symbol, Decimal("0"))
+            await self.monitor.set_cc_balance_start_of_day(
+                monitor_card,
+                current_balance,
+                target_symbol=loss_target_symbol,
+            )
 
         await self.monitor.log_event(
             monitor_card,
@@ -5760,14 +5936,20 @@ class AutoswapBot:
         if monitor_card is not None:
             self.monitor._rollover_card_if_needed(monitor_card)
 
-        # Reset daily CC loss tracking for new day
-        # The CC balance at this point becomes the new start-of-day
+        # Reset daily loss tracking utk hari baru — pakai simbol target efektif
+        # supaya CyLoss bekerja saat target = CC, USDCx, atau USDCx_v2.
         if monitor_card is not None:
-            current_cc = monitor_card.balances.get(CC_SYMBOL, Decimal("0"))
-            await self.monitor.set_cc_balance_start_of_day(monitor_card, current_cc)
+            loss_target_symbol = self._effective_post_target_refill_symbol()
+            current_balance = monitor_card.balances.get(loss_target_symbol, Decimal("0"))
+            await self.monitor.set_cc_balance_start_of_day(
+                monitor_card,
+                current_balance,
+                target_symbol=loss_target_symbol,
+            )
             logger.info(
-                "Daily reset: CC balance start of new day = %s",
-                current_cc,
+                "Daily reset: %s balance start of new day = %s",
+                loss_target_symbol,
+                current_balance,
             )
 
         # Log event to telegram

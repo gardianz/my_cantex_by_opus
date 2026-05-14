@@ -30,8 +30,11 @@ PARTY_INFO_URL = "https://ccview.io/api/v1/internal/api/v1/parties"
 MAX_RETRIES = 2
 REQUEST_TIMEOUT = 20.0
 VALIDATOR_PATTERNS = ("cantex-validator", "Cantex-validator")
-# Minimum seconds between scrapes for the same account (avoid spam)
-MIN_SCRAPE_COOLDOWN_SECONDS = 5.0
+# Minimum seconds between scrapes for the same account (avoid spam).
+# Diturunkan dari 5s -> 2s sesudah perbaikan timestamp-after-completion,
+# agar trigger berurutan tetap dilayani saat scrape sebelumnya benar-benar
+# selesai sukses (bukan "slot hangus" karena timestamp di-set duluan).
+MIN_SCRAPE_COOLDOWN_SECONDS = 2.0
 # Delay before scraping after a swap (ccview.io needs time to index)
 SCRAPE_DELAY_AFTER_SWAP_SECONDS = 5.0
 # Periodic scrape interval (fallback) in seconds — reduced from 120s for faster updates
@@ -73,7 +76,9 @@ class FeeScraper:
         self._session_initialized = False
         self._init_lock = asyncio.Lock()
         self._scrape_lock = asyncio.Lock()
-        # Track last scrape time per account (monotonic) for cooldown
+        # Track last scrape COMPLETION time per account (monotonic) for cooldown.
+        # Sengaja diisi setelah scrape selesai, bukan saat trigger, supaya
+        # cooldown tidak menelan slot saat scrape gagal di tengah jalan.
         self._last_scrape_time: dict[str, float] = {}
         # Store latest results per account
         self._latest_results: dict[str, ActualFeeResult] = {}
@@ -81,6 +86,32 @@ class FeeScraper:
         self._background_tasks: set[asyncio.Task[None]] = set()
         # Periodic scrape tasks
         self._periodic_tasks: dict[str, asyncio.Task[None]] = {}
+        # Callback dipanggil setiap kali _latest_results[account_name] terisi
+        # dengan result.success=True. Dipakai untuk memastikan periodic loop
+        # tetap me-refresh card dashboard.
+        # Signature: callback(account_name: str, result: ActualFeeResult) -> None
+        # NOTE: callback adalah sync function; bila ada coroutine yang harus
+        # diawait, scheduler caller bertanggung jawab create_task.
+        self._on_result_callbacks: list = []
+
+    def register_on_result(self, callback) -> None:
+        """Daftarkan callback yang dipanggil saat ada result.success baru.
+
+        Dipakai bot.AutoswapBot supaya periodic scrape juga merefresh
+        dashboard card, tidak hanya per-hop trigger.
+        """
+        if callback not in self._on_result_callbacks:
+            self._on_result_callbacks.append(callback)
+
+    def _notify_result(self, account_name: str, result: ActualFeeResult) -> None:
+        """Panggil semua callback registered. Gagal silently dengan log warning."""
+        for cb in list(self._on_result_callbacks):
+            try:
+                cb(account_name, result)
+            except Exception as exc:
+                self.log.warning(
+                    "FeeScraper on_result callback raised: %s", exc, exc_info=True
+                )
 
     async def _ensure_client(self) -> httpx.AsyncClient:
         """Lazy init httpx client with session."""
@@ -279,24 +310,39 @@ class FeeScraper:
     ) -> None:
         """Trigger a background scrape (non-blocking).
 
-        Cooldown-based: min 5s between scrapes for the same account.
+        Cooldown-based: min 2s between scrapes for the same account
+        (set setelah scrape selesai sukses, supaya scrape gagal tidak
+        menelan slot trigger berikutnya).
         Called after every successful swap hop.
         """
         if not party_id:
             return
 
-        # Cooldown check: skip if last scrape was too recent
+        # Cooldown check: skip if last SUCCESSFUL scrape completed too recently.
         now = time.monotonic()
         last_time = self._last_scrape_time.get(account_name, 0.0)
         if now - last_time < MIN_SCRAPE_COOLDOWN_SECONDS:
-            self.log.debug(
-                "CCView scrape skipped for %s: cooldown (%.1fs since last)",
+            # [GAS DIAG] log keputusan trigger supaya bisa lihat kenapa akun
+            # tertentu tidak meng-scrape ulang setelah progress.
+            self.log.warning(
+                "[GAS DIAG] CCView trigger SKIP cooldown | %s | round=%s | "
+                "elapsed=%.1fs | min=%.1fs",
                 account_name,
+                completed_round,
                 now - last_time,
+                MIN_SCRAPE_COOLDOWN_SECONDS,
             )
             return
-
-        self._last_scrape_time[account_name] = now
+        self.log.info(
+            "[GAS DIAG] CCView trigger ACCEPT | %s | round=%s | elapsed=%.1fs",
+            account_name,
+            completed_round,
+            now - last_time,
+        )
+        # Sengaja TIDAK set _last_scrape_time di sini. Diset oleh
+        # _background_scrape() setelah scrape sukses. Trigger berurutan saat
+        # scrape pertama belum balik akan tetap dijaga oleh cooldown setelah
+        # scrape sebelumnya selesai (refresh timestamp = waktu completion).
 
         # Create background task
         task = asyncio.create_task(
@@ -322,12 +368,25 @@ class FeeScraper:
             await asyncio.sleep(SCRAPE_DELAY_AFTER_SWAP_SECONDS)
 
             today = datetime.now(timezone.utc).date().isoformat()
+            # [GAS DIAG] track wait di scrape lock — bila banyak akun antre,
+            # akan terlihat selisih waktu antara mulai await dan dapat lock.
+            wait_start = time.monotonic()
             async with self._scrape_lock:
+                wait_elapsed = time.monotonic() - wait_start
+                if wait_elapsed > 1.0:
+                    self.log.info(
+                        "[GAS DIAG] CCView background scrape lock waited %.1fs | %s",
+                        wait_elapsed,
+                        account_name,
+                    )
                 result = await self.fetch_actual_fee(party_id, today)
 
             self._latest_results[account_name] = result
 
             if result.success:
+                # Set timestamp HANYA setelah sukses, bukan saat trigger.
+                # Trigger berikutnya tetap dilayani kalau scrape ini gagal.
+                self._last_scrape_time[account_name] = time.monotonic()
                 self.log.info(
                     "CCView scrape OK | %s | round=%s | "
                     "validator_fee=%s CC (%s tx) | avg=%s CC/swap | swaps=%s",
@@ -338,6 +397,8 @@ class FeeScraper:
                     result.avg_fee_per_swap,
                     result.swap_tx_count,
                 )
+                # Beritahu callback (mis. card update) bahwa ada hasil baru.
+                self._notify_result(account_name, result)
             else:
                 self.log.warning(
                     "CCView scrape failed | %s | round=%s | error=%s",
@@ -400,9 +461,9 @@ class FeeScraper:
                 result = await self.fetch_actual_fee(party_id, today)
 
             self._latest_results[account_name] = result
-            self._last_scrape_time[account_name] = time.monotonic()
 
             if result.success:
+                self._last_scrape_time[account_name] = time.monotonic()
                 self.log.info(
                     "CCView startup scrape OK | %s | date=%s | "
                     "validator_fee=%s CC (%s tx) | avg=%s CC/swap | swaps=%s",
@@ -413,6 +474,7 @@ class FeeScraper:
                     result.avg_fee_per_swap,
                     result.swap_tx_count,
                 )
+                self._notify_result(account_name, result)
             else:
                 self.log.warning(
                     "CCView startup scrape failed | %s | date=%s | error=%s",
@@ -485,6 +547,8 @@ class FeeScraper:
                             result.validator_tx_count,
                             result.avg_fee_per_swap,
                         )
+                        # Pastikan dashboard card juga ikut refresh dari periodic.
+                        self._notify_result(account_name, result)
                     else:
                         self.log.warning(
                             "CCView periodic scrape failed | %s | error=%s",
@@ -546,6 +610,7 @@ class FeeScraper:
                     result.validator_tx_count,
                     result.avg_fee_per_swap,
                 )
+                self._notify_result(account_name, result)
             else:
                 self.log.warning(
                     "CCView scrape_now failed | %s | error=%s",
