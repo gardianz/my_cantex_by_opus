@@ -2180,17 +2180,6 @@ class AutoswapBot:
                 ),
             )
             # --- Round-trip cycle spread loss tracking ---
-            # Metode 1: balance delta per swap (real-time, langsung update CyLoss)
-            loss_target = self._effective_post_target_refill_symbol()
-            bal_target_before = hop_balances_before.get(loss_target, Decimal("0"))
-            bal_target_after = settled_balances.get(loss_target, Decimal("0"))
-            await self.monitor.record_swap_balance_delta(
-                monitor_card,
-                target_symbol=loss_target,
-                balance_before=bal_target_before,
-                balance_after=bal_target_after,
-            )
-            # Metode 2: cycle tracker (open/close pair, untuk per-cycle detail)
             cycle_tracker = self._get_cycle_tracker(account.name)
             cycle_result = cycle_tracker.record_swap(
                 sell_symbol=hop.sell_symbol,
@@ -2751,17 +2740,6 @@ class AutoswapBot:
                 ),
             )
             # --- Round-trip cycle spread loss tracking ---
-            # Metode 1: balance delta per swap (real-time)
-            loss_target = self._effective_post_target_refill_symbol()
-            bal_target_before = hop_balances_before.get(loss_target, Decimal("0"))
-            bal_target_after = settled_balances.get(loss_target, Decimal("0"))
-            await self.monitor.record_swap_balance_delta(
-                monitor_card,
-                target_symbol=loss_target,
-                balance_before=bal_target_before,
-                balance_after=bal_target_after,
-            )
-            # Metode 2: cycle tracker
             cycle_tracker = self._get_cycle_tracker(account.name)
             cycle_result = cycle_tracker.record_swap(
                 sell_symbol=hop.sell_symbol,
@@ -5122,17 +5100,6 @@ class AutoswapBot:
                     f"🛟 Recovery tx {hop.sell_symbol}->{hop.buy_symbol} {tx_identifier or '-'}",
                 )
                 # --- Cycle spread loss tracking utk swap recovery / refill juga ---
-                # Metode 1: balance delta per swap (real-time)
-                loss_target = self._effective_post_target_refill_symbol()
-                bal_target_before = hop_balances_before.get(loss_target, Decimal("0"))
-                bal_target_after = settled_balances.get(loss_target, Decimal("0"))
-                await self.monitor.record_swap_balance_delta(
-                    monitor_card,
-                    target_symbol=loss_target,
-                    balance_before=bal_target_before,
-                    balance_after=bal_target_after,
-                )
-                # Metode 2: cycle tracker
                 actual_recovery_output = self._resolve_actual_output_amount(
                     hop=hop,
                     tx_result=tx_result,
