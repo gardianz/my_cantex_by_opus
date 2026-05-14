@@ -123,6 +123,9 @@ class TelegramAccountTotals:
     lifetime_swaps: int = 0
     lifetime_ok_tx: int = 0
     lifetime_fail_tx: int = 0
+    # Persisted untuk tahan restart: balance start-of-day dan simbol target
+    cc_balance_start_of_day: Decimal = field(default_factory=lambda: Decimal("0"))
+    daily_loss_symbol: str = "CC"
     lifetime_network_fee: dict[str, Decimal] = field(default_factory=dict)
     lifetime_swap_fee: dict[str, Decimal] = field(default_factory=dict)
 
@@ -296,6 +299,11 @@ class TelegramMonitor:
             lifetime_swap_fee_base=dict(persisted.lifetime_swap_fee),
             balances={symbol: Decimal("0") for symbol in SYMBOL_SHORT},
             latest_logs=deque(maxlen=self.runtime.telegram_latest_logs_limit),
+            # Restore balance start-of-day dari persisted state agar tahan restart.
+            # Bot akan override ini saat set_cc_balance_start_of_day dipanggil di startup,
+            # tapi jika hari masih sama, nilai persisted ini yang dipakai untuk hitung CyLoss.
+            cc_balance_start_of_day=persisted.cc_balance_start_of_day,
+            daily_loss_symbol=persisted.daily_loss_symbol or "CC",
         )
         self._cards[account.name] = card
         self._persist_card_state(card)
@@ -462,6 +470,8 @@ class TelegramMonitor:
         card.daily_cc_loss = Decimal("0")
         card.daily_cc_loss_set = False
         card.daily_loss_symbol = target_symbol or "CC"
+        # Persist segera agar tahan restart
+        self._persist_card_state(card)
 
     async def update_daily_cc_loss(
         self,
@@ -2071,6 +2081,10 @@ class TelegramMonitor:
                 self._deserialize_amount_map(payload.get("lifetime_network_fee")),
                 ok_tx_count=lifetime_ok_tx,
             )
+            try:
+                loaded_start_balance = Decimal(str(payload.get("cc_balance_start_of_day", "0")))
+            except Exception:
+                loaded_start_balance = Decimal("0")
             self._account_totals[account_name] = TelegramAccountTotals(
                 current_utc_date=current_utc_date,
                 current_utc_week=current_utc_week,
@@ -2087,6 +2101,8 @@ class TelegramMonitor:
                 lifetime_fail_tx=max(int(payload.get("lifetime_fail_tx", 0)), 0),
                 lifetime_network_fee=lifetime_network_fee,
                 lifetime_swap_fee=self._deserialize_amount_map(payload.get("lifetime_swap_fee")),
+                cc_balance_start_of_day=loaded_start_balance,
+                daily_loss_symbol=str(payload.get("daily_loss_symbol", "CC")) or "CC",
             )
         self._normalize_all_accounts()
 
@@ -2135,6 +2151,9 @@ class TelegramMonitor:
             totals.daily_fail_tx = 0
             totals.daily_network_fee = {}
             totals.daily_swap_fee = {}
+            # Reset balance start-of-day saat hari berganti.
+            # Bot akan set ulang via set_cc_balance_start_of_day saat startup hari baru.
+            totals.cc_balance_start_of_day = Decimal("0")
         elif day_gap < 0:
             totals.current_utc_date = today_str
         if totals.current_utc_week != today_week:
@@ -2220,6 +2239,9 @@ class TelegramMonitor:
         totals.lifetime_fail_tx = self._lifetime_fail_tx_total(card)
         totals.lifetime_network_fee = self._current_lifetime_network_fee(card)
         totals.lifetime_swap_fee = self._current_lifetime_swap_fee(card)
+        # Persist balance start-of-day agar tahan restart
+        totals.cc_balance_start_of_day = card.cc_balance_start_of_day
+        totals.daily_loss_symbol = card.daily_loss_symbol or "CC"
         self._account_totals[card.account_name] = totals
         self._save_state()
 
@@ -2243,6 +2265,8 @@ class TelegramMonitor:
                     "lifetime_fail_tx": totals.lifetime_fail_tx,
                     "lifetime_network_fee": self._serialize_amount_map(totals.lifetime_network_fee),
                     "lifetime_swap_fee": self._serialize_amount_map(totals.lifetime_swap_fee),
+                    "cc_balance_start_of_day": str(totals.cc_balance_start_of_day),
+                    "daily_loss_symbol": totals.daily_loss_symbol or "CC",
                 }
                 for account_name, totals in sorted(self._account_totals.items())
             },
