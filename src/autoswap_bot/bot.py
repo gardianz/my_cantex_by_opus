@@ -3296,6 +3296,18 @@ class AutoswapBot:
         remaining = self._non_target_balances_remaining(balances, target_symbol)
         if not remaining:
             logger.debug("Refill after target: tidak ada sisa non-%s untuk di-refill", target_symbol)
+            # Tetap hitung daily loss meskipun tidak ada yang perlu di-refill.
+            # Ini penting agar CyLoss ter-update saat semua token sudah di target.
+            balance_now = balances.get(target_symbol, Decimal("0"))
+            logger.info(
+                "[CYLOSS DIAG] _refill_after_target early return | target=%s | "
+                "start_of_day=%s | balance_now=%s | daily_loss_symbol=%s",
+                target_symbol,
+                monitor_card.cc_balance_start_of_day if monitor_card is not None else "n/a",
+                balance_now,
+                monitor_card.daily_loss_symbol if monitor_card is not None else "n/a",
+            )
+            await self.monitor.update_daily_cc_loss(monitor_card, balance_now)
             return
 
         logger.info(

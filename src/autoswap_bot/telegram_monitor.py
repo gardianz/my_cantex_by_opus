@@ -419,6 +419,7 @@ class TelegramMonitor:
         card: TelegramCardState | None,
         *,
         cycle_result: CycleResult,
+        force: bool = True,
     ) -> None:
         """Record a completed round-trip cycle spread loss."""
         if card is None:
@@ -429,6 +430,8 @@ class TelegramMonitor:
             card.total_cycle_spread_loss.get(symbol, Decimal("0")) + cycle_result.spread_loss
         )
         card.cycle_count += 1
+        # Refresh dashboard agar CyLoss langsung terlihat
+        await self._refresh_outputs(card, force=force)
 
     async def set_cc_balance_start_of_day(
         self,
@@ -463,10 +466,12 @@ class TelegramMonitor:
         loss = balance_start_of_day - balance_after_refill (positif = rugi)
         Symbol yang dipakai untuk perbandingan ditentukan oleh
         ``card.daily_loss_symbol`` yang di-set saat `set_cc_balance_start_of_day`.
+
+        Guard cc_balance_start_of_day <= 0 dihapus: kita tetap set daily_cc_loss_set=True
+        agar CyLoss menampilkan angka (0 atau negatif) daripada "-".
+        Ini penting saat bot start dengan USDCx=0 lalu mendapat USDCx dari swap.
         """
         if card is None:
-            return
-        if card.cc_balance_start_of_day <= Decimal("0"):
             return
         card.daily_cc_loss = card.cc_balance_start_of_day - balance_after_refill
         card.daily_cc_loss_set = True
