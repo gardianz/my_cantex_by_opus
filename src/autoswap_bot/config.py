@@ -213,6 +213,12 @@ class RuntimeConfig:
     default_continue_on_low_balance: bool
     max_retries: int
     retry_base_delay: float
+    # Konfigurasi mode withdraw
+    withdraw_target_address: str
+    withdraw_saldo_sisa: Decimal
+    withdraw_fee_reserve: Decimal
+    withdraw_delay_seconds: float
+    withdraw_symbols: list[str]
 
 
 @dataclass(frozen=True)
@@ -379,6 +385,26 @@ def load_config(path: str | Path) -> BotConfig:
         ),
         max_retries=int(settings.get("max_retries", 3)),
         retry_base_delay=float(settings.get("retry_base_delay", 1.0)),
+        # Konfigurasi mode withdraw
+        withdraw_target_address=str(settings.get("withdraw_target_address", "")),
+        withdraw_saldo_sisa=_to_decimal(
+            settings.get("withdraw_saldo_sisa", "0"),
+            "settings.withdraw_saldo_sisa",
+        ),
+        withdraw_fee_reserve=_to_decimal(
+            settings.get("withdraw_fee_reserve", "0"),
+            "settings.withdraw_fee_reserve",
+        ),
+        withdraw_delay_seconds=float(settings.get("withdraw_delay_seconds", 10.0)),
+        withdraw_symbols=[
+            str(s).strip()
+            for s in (
+                settings.get("withdraw_symbols", ["CC"])
+                if isinstance(settings.get("withdraw_symbols"), list)
+                else ["CC"]
+            )
+            if str(s).strip()
+        ] or ["CC"],
     )
 
     if runtime.execution_mode not in {"sequential", "concurrent"}:

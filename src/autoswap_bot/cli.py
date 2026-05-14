@@ -5,12 +5,14 @@ import asyncio
 import signal
 import sys
 import threading
+from decimal import Decimal
 from pathlib import Path
 
 from .bot import AutoswapBot, configure_logging, summarize_results
 from .estimator import render_required_cc_report
 from .config import load_config
 from .env_loader import load_dotenv_file
+from .withdraw_bot import WithdrawBot
 
 
 STRATEGY_CHOICES = {
@@ -26,6 +28,7 @@ STARTUP_MODE_CHOICES = {
     "3": "free_then_swap",
     "4": "refill_cc",
     "5": "check_accounts",
+    "6": "withdraw",
 }
 
 POST_TARGET_REFILL_CHOICES = {
@@ -76,9 +79,10 @@ def _prompt_startup_mode() -> str:
     print("3. Mode free lalu swap", flush=True)
     print("4. Mode refill semua token ke CC lalu berhenti", flush=True)
     print("5. Mode cek akun (lihat balance, reward, fee)", flush=True)
+    print("6. Mode withdraw (transfer CC ke alamat tujuan)", flush=True)
 
     while True:
-        print("Masukkan pilihan (1/2/3/4/5): ", end="", flush=True)
+        print("Masukkan pilihan (1/2/3/4/5/6): ", end="", flush=True)
         try:
             answer = input().strip()
         except EOFError:
@@ -92,7 +96,7 @@ def _prompt_startup_mode() -> str:
 
 def _prompt_post_target_refill_symbol(startup_mode: str) -> str:
     """Prompt target refill setelah progress swap tercapai."""
-    if startup_mode in {"refill_cc", "check_accounts"}:
+    if startup_mode in {"refill_cc", "check_accounts", "withdraw"}:
         return "CC"
     if not sys.stdin.isatty():
         return "CC"
@@ -177,7 +181,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--mode",
         default=None,
-        choices=["swap_only", "free_only", "free_then_swap", "refill_cc", "check_accounts"],
+        choices=["swap_only", "free_only", "free_then_swap", "refill_cc", "check_accounts", "withdraw"],
         help="Override startup mode. Jika tidak diset, akan ditanya interaktif.",
     )
     parser.add_argument(
@@ -225,6 +229,36 @@ async def _run(
         use_utc=True,
         terminal_dashboard_enabled=config.runtime.terminal_dashboard_enabled,
     )
+
+    # Mode withdraw: jalankan WithdrawBot, tidak perlu AutoswapBot
+    if startup_mode == "withdraw":
+        target_address = config.runtime.withdraw_target_address
+        if not target_address:
+            # Prompt interaktif jika tidak dikonfigurasi di config
+            if sys.stdin.isatty():
+                print("\nMasukkan alamat tujuan withdraw (Cantex::1220...): ", end="", flush=True)
+                try:
+                    target_address = input().strip()
+                except EOFError:
+                    target_address = ""
+            if not target_address:
+                print("❌ ERROR: withdraw_target_address tidak dikonfigurasi.", flush=True)
+                print("Tambahkan di [settings] accounts.toml:", flush=True)
+                print('  withdraw_target_address = "Cantex::1220..."', flush=True)
+                return 1
+
+        withdraw_bot = WithdrawBot(
+            config,
+            repo_root=repo_root,
+            target_address=target_address,
+            saldo_sisa=config.runtime.withdraw_saldo_sisa,
+            fee_reserve=config.runtime.withdraw_fee_reserve,
+            delay_seconds=config.runtime.withdraw_delay_seconds,
+            symbols=config.runtime.withdraw_symbols,
+        )
+        await withdraw_bot.run()
+        return 0
+
     bot = AutoswapBot(
         config,
         repo_root=repo_root,

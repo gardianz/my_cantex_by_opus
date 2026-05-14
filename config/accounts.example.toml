@@ -47,6 +47,14 @@ default_continue_on_low_balance = true
 max_retries = 3
 retry_base_delay = 5.0
 
+# Mode Withdraw — konfigurasi untuk mode 6 (withdraw CC ke alamat tujuan)
+# Aktifkan dengan memilih mode 6 saat startup, atau --mode withdraw
+# withdraw_target_address = "Cantex::1220..."   # Alamat tujuan (wajib diisi)
+# withdraw_saldo_sisa = "0"                     # Saldo CC yang disisakan di akun
+# withdraw_fee_reserve = "0"                    # Reserve untuk fee transfer
+# withdraw_delay_seconds = 10                   # Delay antar akun (detik)
+# withdraw_symbols = ["CC"]                     # Simbol yang di-withdraw (default CC)
+
 [defaults]
 strategy = "4"                    # 1=CC→USDCx, 2=CC→CBTC, 3=Cycle, 4=Reserve
 rounds = 26                       # Target swap per hari (bisa range: { min = 24, max = 28 })
