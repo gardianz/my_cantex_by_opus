@@ -405,10 +405,10 @@ class TelegramMonitor:
         self._rollover_card_if_needed(card)
         card.balances.update(balances)
         # Hitung CyLoss real-time dari balance terkini vs start-of-day.
-        # Selalu hitung jika daily_loss_symbol sudah di-set (artinya set_cc_balance_start_of_day
-        # sudah dipanggil). Tidak perlu menunggu refill selesai.
-        # Ini robust terhadap swap timeout karena berbasis balance nyata di blockchain.
-        if card.daily_loss_symbol:
+        # Guard: cc_balance_start_of_day harus > 0 agar tidak menghasilkan
+        # nilai negatif besar saat bot baru start dan start-of-day belum di-set.
+        # Ini terjadi karena update_balances dipanggil sebelum set_cc_balance_start_of_day.
+        if card.daily_loss_symbol and card.cc_balance_start_of_day > Decimal("0"):
             loss_symbol = card.daily_loss_symbol
             current_balance = card.balances.get(loss_symbol, Decimal("0"))
             card.daily_cc_loss = card.cc_balance_start_of_day - current_balance
