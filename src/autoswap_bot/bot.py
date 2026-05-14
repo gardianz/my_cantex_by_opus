@@ -2188,20 +2188,8 @@ class AutoswapBot:
                 buy_amount=actual_output_amount,
                 network_fee=actual_network_fee,
                 swap_fee=actual_swap_fee,
-            )
-            # [CYLOSS DIAG] track tiap call ke record_swap dari path utama (_execute_round_dynamic)
-            logger.info(
-                "[CYLOSS DIAG] record_swap (round path) | mode=%s | %s->%s | "
-                "sell=%s buy=%s | result=%s | total_usdcx=%s | total_cc=%s | count=%s",
-                cycle_tracker.mode,
-                hop.sell_symbol,
-                hop.buy_symbol,
-                hop.sell_amount,
-                actual_output_amount,
-                "complete" if cycle_result is not None else "none",
-                cycle_tracker.total_usdcx_spread_loss,
-                cycle_tracker.total_cc_spread_loss,
-                cycle_tracker.cycle_count,
+                balances_before=hop_balances_before,
+                balances_after=settled_balances,
             )
             if cycle_result is not None:
                 await self.monitor.record_cycle_spread_loss(
@@ -2760,20 +2748,8 @@ class AutoswapBot:
                 buy_amount=actual_output_amount,
                 network_fee=actual_network_fee,
                 swap_fee=actual_swap_fee,
-            )
-            # [CYLOSS DIAG] track tiap call ke record_swap dari path v2 (_execute_round_dynamic_v2)
-            logger.info(
-                "[CYLOSS DIAG] record_swap (round path v2) | mode=%s | %s->%s | "
-                "sell=%s buy=%s | result=%s | total_usdcx=%s | total_cc=%s | count=%s",
-                cycle_tracker.mode,
-                hop.sell_symbol,
-                hop.buy_symbol,
-                hop.sell_amount,
-                actual_output_amount,
-                "complete" if cycle_result is not None else "none",
-                cycle_tracker.total_usdcx_spread_loss,
-                cycle_tracker.total_cc_spread_loss,
-                cycle_tracker.cycle_count,
+                balances_before=hop_balances_before,
+                balances_after=settled_balances,
             )
             if cycle_result is not None:
                 await self.monitor.record_cycle_spread_loss(
@@ -5128,6 +5104,8 @@ class AutoswapBot:
                     buy_amount=actual_recovery_output,
                     network_fee=actual_network_fee,
                     swap_fee=actual_swap_fee,
+                    balances_before=hop_balances_before,
+                    balances_after=settled_balances,
                 )
                 logger.info(
                     "[CYLOSS DIAG] record_swap (recovery path) | mode=%s | %s->%s | "
@@ -6338,6 +6316,16 @@ class AutoswapBot:
                 force_log=force_log,
             )
             if synced_completed_rounds is not None:
+                # Trigger ccview scrape setiap kali progress naik dari sebelumnya.
+                # Ini memastikan Gas fee di-update segera setelah round sync,
+                # tanpa menunggu hop swap berikutnya.
+                if synced_completed_rounds > previous_completed_rounds:
+                    self._schedule_ccview_scrape_after_progress(
+                        account_name=account.name,
+                        completed_round=synced_completed_rounds,
+                        monitor_card=monitor_card,
+                        reason="round_sync",
+                    )
                 if not require_increment:
                     return synced_completed_rounds
                 if (

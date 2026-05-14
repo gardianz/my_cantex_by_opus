@@ -106,6 +106,8 @@ class CycleTracker:
         buy_amount: Decimal,
         network_fee: dict[str, Decimal] | None = None,
         swap_fee: dict[str, Decimal] | None = None,
+        balances_before: dict[str, Decimal] | None = None,
+        balances_after: dict[str, Decimal] | None = None,
     ) -> CycleResult | None:
         """Record a completed swap and return CycleResult if a cycle just completed.
 
@@ -116,6 +118,11 @@ class CycleTracker:
             buy_amount: Amount received (net output from tx)
             network_fee: Network fees paid (by symbol)
             swap_fee: Swap/admin fees paid (by symbol)
+            balances_before: Balance snapshot sebelum swap (opsional). Jika tersedia,
+                dipakai untuk menghitung cycle loss berbasis delta balance nyata.
+                Lebih akurat dari sell_amount/buy_amount karena mencerminkan
+                perubahan saldo aktual di akun.
+            balances_after: Balance snapshot setelah swap (opsional, pasangan balances_before).
 
         Returns:
             CycleResult if a round-trip cycle just completed, None otherwise.
@@ -127,21 +134,34 @@ class CycleTracker:
             foreign_symbols = ("CBTC", "ETH", "BTC")  # Extendable list
 
             if sell_symbol == "USDCx" and buy_symbol in foreign_symbols:
-                # Starting USDCx cycle: USDCx going out to foreign token
+                # Starting USDCx cycle: USDCx going out to foreign token.
+                # Gunakan balance delta jika tersedia (lebih akurat dari sell_amount).
+                actual_sell = sell_amount
+                if balances_before is not None and balances_after is not None:
+                    bal_before = balances_before.get("USDCx", Decimal("0"))
+                    bal_after = balances_after.get("USDCx", Decimal("0"))
+                    delta = bal_before - bal_after
+                    if delta > Decimal("0"):
+                        actual_sell = delta
+                        logger.debug(
+                            "USDCx cycle start: pakai balance delta %s (sell_amount=%s)",
+                            actual_sell,
+                            sell_amount,
+                        )
                 if self._pending_usdcx is not None and self._pending_usdcx.active:
                     logger.debug(
                         "USDCx cycle restarted (previous pending overwritten): "
                         "old_start=%s, new_start=%s",
                         self._pending_usdcx.sell_amount,
-                        sell_amount,
+                        actual_sell,
                     )
                 self._pending_usdcx = PendingUSDCxCycle(
-                    sell_amount=sell_amount,
+                    sell_amount=actual_sell,
                     target_symbol=buy_symbol,
                 )
                 logger.debug(
                     "USDCx cycle started: sell_amount=%s USDCx → %s",
-                    sell_amount,
+                    actual_sell,
                     buy_symbol,
                 )
                 return None
@@ -149,8 +169,20 @@ class CycleTracker:
             if buy_symbol == "USDCx" and self._pending_usdcx is not None:
                 # Check if this foreign token matches our pending target
                 if sell_symbol == self._pending_usdcx.target_symbol:
-                    # Completing USDCx cycle: foreign coming back to USDCx
+                    # Completing USDCx cycle: foreign coming back to USDCx.
+                    # Gunakan balance delta jika tersedia (lebih akurat dari buy_amount).
                     end_amount = buy_amount
+                    if balances_before is not None and balances_after is not None:
+                        bal_before = balances_before.get("USDCx", Decimal("0"))
+                        bal_after = balances_after.get("USDCx", Decimal("0"))
+                        delta = bal_after - bal_before
+                        if delta > Decimal("0"):
+                            end_amount = delta
+                            logger.debug(
+                                "USDCx cycle end: pakai balance delta %s (buy_amount=%s)",
+                                end_amount,
+                                buy_amount,
+                            )
                     spread_loss = self._pending_usdcx.sell_amount - end_amount
                     result = CycleResult(
                         origin_symbol="USDCx",
@@ -176,7 +208,20 @@ class CycleTracker:
         # Only track if mode is CC
         if self.mode == "CC":
             if sell_symbol == CC_SYMBOL and buy_symbol in ("USDCx", "CBTC"):
-                # Starting CC cycle: CC going out to foreign
+                # Starting CC cycle: CC going out to foreign.
+                # Gunakan balance delta jika tersedia.
+                actual_sell = sell_amount
+                if balances_before is not None and balances_after is not None:
+                    bal_before = balances_before.get(CC_SYMBOL, Decimal("0"))
+                    bal_after = balances_after.get(CC_SYMBOL, Decimal("0"))
+                    delta = bal_before - bal_after
+                    if delta > Decimal("0"):
+                        actual_sell = delta
+                        logger.debug(
+                            "CC cycle start: pakai balance delta %s (sell_amount=%s)",
+                            actual_sell,
+                            sell_amount,
+                        )
                 # Overwrite any existing pending CC cycle (restart mid-cycle)
                 if self._pending_cc is not None and self._pending_cc.active:
                     logger.debug(
@@ -184,16 +229,16 @@ class CycleTracker:
                         "old_start=%s CC→%s, new_start=%s CC→%s",
                         self._pending_cc.sell_amount,
                         self._pending_cc.target_symbol,
-                        sell_amount,
+                        actual_sell,
                         buy_symbol,
                     )
                 self._pending_cc = PendingCCCycle(
-                    sell_amount=sell_amount,
+                    sell_amount=actual_sell,
                     target_symbol=buy_symbol,
                 )
                 logger.debug(
                     "CC cycle started: sell_amount=%s CC → %s",
-                    sell_amount,
+                    actual_sell,
                     buy_symbol,
                 )
                 return None
@@ -201,16 +246,33 @@ class CycleTracker:
             if sell_symbol in ("USDCx", "CBTC") and buy_symbol == CC_SYMBOL:
                 # Completing CC cycle: foreign coming back to CC
                 if self._pending_cc is not None and self._pending_cc.active:
-                    # For CC cycle, spread loss = CC_start - CC_end
-                    # We EXCLUDE network fee from loss calculation because fee is tracked separately.
-                    # buy_amount is the net CC received after swap.
-                    # Network fee is charged separately on CC, so we add it back to get
-                    # the "true" CC output before fee deduction.
-                    cc_network_fee = Decimal("0")
-                    if network_fee:
-                        cc_network_fee = network_fee.get(CC_SYMBOL, Decimal("0"))
+                    # Gunakan balance delta CC jika tersedia (lebih akurat).
+                    # Jika tidak, fallback ke buy_amount + cc_network_fee (metode lama).
+                    if balances_before is not None and balances_after is not None:
+                        bal_before = balances_before.get(CC_SYMBOL, Decimal("0"))
+                        bal_after = balances_after.get(CC_SYMBOL, Decimal("0"))
+                        delta = bal_after - bal_before
+                        if delta > Decimal("0"):
+                            end_amount = delta
+                            logger.debug(
+                                "CC cycle end: pakai balance delta %s (buy_amount=%s)",
+                                end_amount,
+                                buy_amount,
+                            )
+                        else:
+                            # Delta negatif atau nol (mis. fee lebih besar dari output)
+                            # fallback ke metode lama
+                            cc_network_fee = Decimal("0")
+                            if network_fee:
+                                cc_network_fee = network_fee.get(CC_SYMBOL, Decimal("0"))
+                            end_amount = buy_amount + cc_network_fee
+                    else:
+                        # Tidak ada balance snapshot, pakai metode lama
+                        cc_network_fee = Decimal("0")
+                        if network_fee:
+                            cc_network_fee = network_fee.get(CC_SYMBOL, Decimal("0"))
+                        end_amount = buy_amount + cc_network_fee
 
-                    end_amount = buy_amount + cc_network_fee
                     spread_loss = self._pending_cc.sell_amount - end_amount
                     result = CycleResult(
                         origin_symbol="CC",
