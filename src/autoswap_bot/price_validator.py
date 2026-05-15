@@ -174,38 +174,59 @@ class PriceValidator:
         buy_symbol: str,
         quote_price: Decimal,
     ) -> tuple[bool, str]:
-        """Cek apakah ini peluang arbitrase (harga lebih baik dari reverse pair).
+        """Cek apakah ini peluang arbitrase: beli CBTC lebih murah dari harga jual sebelumnya.
 
-        Khusus untuk CBTC→USDCx: bypass validasi jika harga lebih menguntungkan
-        dari USDCx→CBTC sebelumnya.
+        Khusus untuk USDCx→CBTC (beli CBTC):
+        - Ambil harga jual CBTC terakhir dari CBTC→USDCx history
+        - Harga jual = berapa USDCx yang diterima per 1 CBTC
+        - Harga beli sekarang = berapa USDCx yang harus dibayar per 1 CBTC (dari quote)
+        - Jika harga beli < harga jual → beli lebih murah → ARBITRASE → bypass validasi
+
+        Contoh:
+          Jual CBTC kemarin: 1 CBTC = 82,000 USDCx (harga jual)
+          Beli CBTC sekarang: 1 CBTC = 80,000 USDCx (harga beli)
+          80,000 < 82,000 → beli lebih murah dari harga jual → LANGSUNG SWAP!
 
         Returns: (is_arbitrage, reason)
         """
-        if sell_symbol != "CBTC" or buy_symbol != "USDCx":
-            return False, "not_cbtc_usdcx"
+        # Hanya berlaku untuk USDCx→CBTC (beli CBTC)
+        if sell_symbol != "USDCx" or buy_symbol != "CBTC":
+            return False, "not_usdcx_cbtc"
 
-        # Cek reverse pair: USDCx→CBTC
-        reverse = self.get_last_execution("USDCx", "CBTC")
-        if reverse is None:
-            return False, "no_reverse_reference"
+        # Ambil harga jual CBTC terakhir dari CBTC→USDCx history
+        # trade_price di CBTC→USDCx = USDCx per CBTC (berapa USDCx dapat per 1 CBTC)
+        last_sell = self.get_last_execution("CBTC", "USDCx")
+        if last_sell is None:
+            return False, "no_sell_reference"
 
-        # Harga CBTC→USDCx saat ini vs harga USDCx→CBTC sebelumnya
-        # Jika 1/quote_price > reverse.trade_price, artinya CBTC lebih mahal sekarang
-        # = lebih menguntungkan untuk jual CBTC
-        if reverse.trade_price <= Decimal("0"):
-            return False, "reverse_price_zero"
+        if last_sell.trade_price <= Decimal("0") or last_sell.amount_in <= Decimal("0"):
+            return False, "sell_reference_invalid"
 
-        # quote_price = USDCx per CBTC
-        # reverse.trade_price = CBTC per USDCx
-        # Jika quote_price > 1/reverse.trade_price, artinya harga CBTC naik
-        implied_cbtc_price = Decimal("1") / reverse.trade_price
-        if quote_price > implied_cbtc_price:
+        # last_sell.trade_price = USDCx per CBTC (harga jual CBTC)
+        # quote_price = output/input = CBTC per USDCx
+        # Konversi ke USDCx per CBTC: 1/quote_price = harga beli CBTC dalam USDCx
+        if quote_price <= Decimal("0"):
+            return False, "quote_price_zero"
+
+        buy_price_usdcx_per_cbtc = Decimal("1") / quote_price   # USDCx yang dibayar per CBTC
+        sell_price_usdcx_per_cbtc = last_sell.trade_price        # USDCx yang diterima per CBTC
+
+        if buy_price_usdcx_per_cbtc < sell_price_usdcx_per_cbtc:
+            profit_pct = (
+                (sell_price_usdcx_per_cbtc - buy_price_usdcx_per_cbtc)
+                / sell_price_usdcx_per_cbtc
+                * 100
+            )
             return True, (
-                f"arbitrage: CBTC_price={quote_price} > implied={implied_cbtc_price:.6f} "
-                f"(from USDCx->CBTC ref={reverse.trade_price})"
+                f"arbitrage USDCx->CBTC: beli={buy_price_usdcx_per_cbtc:.2f} USDCx/CBTC < "
+                f"jual={sell_price_usdcx_per_cbtc:.2f} USDCx/CBTC | "
+                f"profit_est={profit_pct:.3f}%"
             )
 
-        return False, f"no_arbitrage: CBTC_price={quote_price} <= implied={implied_cbtc_price:.6f}"
+        return False, (
+            f"no_arbitrage: beli={buy_price_usdcx_per_cbtc:.2f} >= "
+            f"jual={sell_price_usdcx_per_cbtc:.2f} USDCx/CBTC"
+        )
 
     def get_summary(self) -> dict[str, Any]:
         """Ringkasan execution prices yang tersimpan."""
