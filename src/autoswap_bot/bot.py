@@ -3798,7 +3798,10 @@ class AutoswapBot:
         free_fee_sequential_account_name: str | None = None,
         allow_network_fee_cap_bypass: bool = False,
     ) -> tuple[dict[str, Any] | None, str | None]:
-        confirm_timeout = max(float(hop.estimated_time_seconds) * 4.0, 90.0)
+        # Timeout konfirmasi swap: max(estimated_time * 4, min_timeout_dari_config)
+        # Default minimum 90 detik, bisa diubah via swap_confirmation_timeout_seconds di config.
+        min_timeout = self.config.runtime.swap_confirmation_timeout_seconds
+        confirm_timeout = max(float(hop.estimated_time_seconds) * 4.0, min_timeout)
         lock_acquired = False
         if free_fee_sequential_account_name is not None:
             lock_acquired = await self._acquire_free_fee_sequence_slot(

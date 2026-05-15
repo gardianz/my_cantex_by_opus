@@ -46,6 +46,7 @@ log_level = "INFO"
 default_continue_on_low_balance = true
 max_retries = 3
 retry_base_delay = 5.0
+swap_confirmation_timeout_seconds = 90    # Minimum timeout konfirmasi swap (detik). Default 90.
 
 # Mode Withdraw — konfigurasi untuk mode 6 (withdraw CC ke alamat tujuan)
 # Aktifkan dengan memilih mode 6 saat startup, atau --mode withdraw

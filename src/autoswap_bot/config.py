@@ -213,6 +213,7 @@ class RuntimeConfig:
     default_continue_on_low_balance: bool
     max_retries: int
     retry_base_delay: float
+    swap_confirmation_timeout_seconds: float
     # Konfigurasi mode withdraw
     withdraw_target_address: str
     withdraw_saldo_sisa: Decimal
@@ -385,6 +386,9 @@ def load_config(path: str | Path) -> BotConfig:
         ),
         max_retries=int(settings.get("max_retries", 3)),
         retry_base_delay=float(settings.get("retry_base_delay", 1.0)),
+        swap_confirmation_timeout_seconds=float(
+            settings.get("swap_confirmation_timeout_seconds", 90.0)
+        ),
         # Konfigurasi mode withdraw
         withdraw_target_address=str(settings.get("withdraw_target_address", "")),
         withdraw_saldo_sisa=_to_decimal(
