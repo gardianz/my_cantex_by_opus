@@ -404,15 +404,6 @@ class TelegramMonitor:
             return
         self._rollover_card_if_needed(card)
         card.balances.update(balances)
-        # Hitung CyLoss real-time dari balance terkini vs start-of-day.
-        # Guard: cc_balance_start_of_day harus > 0 agar tidak menghasilkan
-        # nilai negatif besar saat bot baru start dan start-of-day belum di-set.
-        # Ini terjadi karena update_balances dipanggil sebelum set_cc_balance_start_of_day.
-        if card.daily_loss_symbol and card.cc_balance_start_of_day > Decimal("0"):
-            loss_symbol = card.daily_loss_symbol
-            current_balance = card.balances.get(loss_symbol, Decimal("0"))
-            card.daily_cc_loss = card.cc_balance_start_of_day - current_balance
-            card.daily_cc_loss_set = True
         await self._refresh_outputs(card, force=force)
 
     async def update_fee_totals(
@@ -429,6 +420,38 @@ class TelegramMonitor:
         card.total_network_fee = dict(total_network_fee)
         card.total_swap_fee = dict(total_swap_fee)
         self._persist_card_state(card)
+        await self._refresh_outputs(card, force=force)
+
+    async def record_round_cycle_loss(
+        self,
+        card: TelegramCardState | None,
+        *,
+        loss_symbol: str,
+        balance_before: Decimal,
+        balance_after: Decimal,
+        force: bool = True,
+    ) -> None:
+        """Catat cycle loss per round: loss = balance_before - balance_after.
+
+        Dipanggil setelah setiap round selesai (progress naik) dengan balance
+        snapshot sebelum dan sesudah round. Ini adalah metode utama untuk
+        menghitung CyLoss sesuai permintaan user:
+        - Mode CC: cc_before_swap_out - cc_after_swap_in
+        - Mode USDCx: usdcx_before_swap_out - usdcx_after_swap_in
+        """
+        if card is None:
+            return
+        self._rollover_card_if_needed(card)
+        loss = balance_before - balance_after
+        # Akumulasi ke total_cycle_spread_loss
+        card.total_cycle_spread_loss[loss_symbol] = (
+            card.total_cycle_spread_loss.get(loss_symbol, Decimal("0")) + loss
+        )
+        card.cycle_count += 1
+        # Juga update daily_cc_loss untuk display
+        card.daily_cc_loss = card.total_cycle_spread_loss.get(loss_symbol, Decimal("0"))
+        card.daily_cc_loss_set = True
+        card.daily_loss_symbol = loss_symbol
         await self._refresh_outputs(card, force=force)
 
     async def record_cycle_spread_loss(
@@ -1839,13 +1862,24 @@ class TelegramMonitor:
         """Format cycle loss untuk compact display.
 
         Prioritas:
-        1. daily_cc_loss_set: loss dari balance_start_of_day - balance_current
-           (dihitung real-time setiap update_balances, paling akurat)
-        2. total_cycle_spread_loss: per-cycle tracking (legacy fallback)
+        1. total_cycle_spread_loss: akumulasi per-round cycle loss
+           (dihitung dari balance_before_round - balance_after_round)
+        2. daily_cc_loss_set: daily simple loss (fallback)
         """
         symbol_label = SYMBOL_SHORT.get(card.daily_loss_symbol or "CC", card.daily_loss_symbol or "CC")
 
-        # Prioritas 1: daily loss berbasis balance snapshot (real-time)
+        # Prioritas 1: per-round cycle loss (akumulasi dari record_round_cycle_loss)
+        values = card.total_cycle_spread_loss
+        if values:
+            # Tampilkan akumulasi per simbol dengan 2 desimal
+            total_loss = sum(values.values())
+            rendered = format(total_loss, ".2f").rstrip("0").rstrip(".")
+            if not rendered or rendered == "-":
+                rendered = "0"
+            count_str = f" ({card.cycle_count}x)" if card.cycle_count > 0 else ""
+            return f"{rendered} {symbol_label}{count_str}"
+
+        # Fallback: daily simple loss
         if card.daily_cc_loss_set:
             loss = card.daily_cc_loss
             rendered = format(loss, ".2f").rstrip("0").rstrip(".")
@@ -1853,21 +1887,7 @@ class TelegramMonitor:
                 rendered = "0"
             return f"{rendered} {symbol_label}"
 
-        # Fallback: show per-cycle spread loss (legacy)
-        values = card.total_cycle_spread_loss
-        if not values:
-            return "-"
-        parts: list[str] = []
-        for symbol, amount in sorted(values.items()):
-            if amount == Decimal("0"):
-                continue
-            short = SYMBOL_SHORT.get(symbol, symbol)
-            rendered = format(amount, ".6f").rstrip("0").rstrip(".")
-            parts.append(f"{short} {rendered}")
-        loss_text = ", ".join(parts) if parts else "-"
-        if card.cycle_count > 0:
-            return f"{loss_text} ({card.cycle_count}x)"
-        return loss_text
+        return "-"
 
     def _format_amount_map(self, values: dict[str, Decimal]) -> str:
         if not values:
@@ -2210,6 +2230,11 @@ class TelegramMonitor:
             card.day_session_network_fee_offset = dict(card.total_network_fee)
             card.day_session_free_network_fee_offset = dict(card.free_network_fee_credit)
             card.day_session_swap_fee_offset = dict(card.total_swap_fee)
+            # Reset cycle loss harian
+            card.total_cycle_spread_loss = {}
+            card.cycle_count = 0
+            card.daily_cc_loss = Decimal("0")
+            card.daily_cc_loss_set = False
             changed = True
         if card.current_utc_week != today_week:
             card.current_utc_week = today_week

@@ -5207,6 +5207,14 @@ class AutoswapBot:
                     result=result,
                 )
                 return
+            # Simpan balance sebelum round untuk cycle loss calculation
+            _loss_symbol = self._effective_post_target_refill_symbol()
+            _balance_before_round = (
+                monitor_card.balances.get(_loss_symbol, Decimal("0"))
+                if monitor_card is not None
+                else Decimal("0")
+            )
+            _rounds_before = result.completed_rounds
             result.completed_rounds = await self._wait_for_trading_history_round_progress(
                 sdk=sdk,
                 account=account,
@@ -5216,6 +5224,32 @@ class AutoswapBot:
                 previous_completed_rounds=result.completed_rounds,
             )
             result.swap_transactions = result.completed_rounds
+            # Hitung cycle loss jika ada round baru yang selesai
+            if result.completed_rounds > _rounds_before and monitor_card is not None:
+                # Ambil balance terkini setelah round selesai
+                try:
+                    _info_after = await sdk.get_account_info()
+                    _balances_after = self._balances_by_symbol(_info_after)
+                    await self.monitor.update_balances(monitor_card, _balances_after)
+                    _balance_after_round = _balances_after.get(_loss_symbol, Decimal("0"))
+                    if _balance_before_round > Decimal("0"):
+                        await self.monitor.record_round_cycle_loss(
+                            monitor_card,
+                            loss_symbol=_loss_symbol,
+                            balance_before=_balance_before_round,
+                            balance_after=_balance_after_round,
+                        )
+                        logger.info(
+                            "Cycle loss round %s: %s_before=%s | %s_after=%s | loss=%s",
+                            result.completed_rounds,
+                            _loss_symbol,
+                            _balance_before_round,
+                            _loss_symbol,
+                            _balance_after_round,
+                            _balance_before_round - _balance_after_round,
+                        )
+                except Exception as exc:
+                    logger.debug("Gagal hitung cycle loss round: %s", exc)
             self._persist_round_session_progress(
                 account=account,
                 prepared_run=prepared_run,
