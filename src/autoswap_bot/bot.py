@@ -6524,6 +6524,13 @@ class AutoswapBot:
             requested_rounds=prepared_run.rounds,
             completed_rounds=synced_completed_rounds,
         )
+        # Hitung cycle loss dari trading history
+        await self._update_cycle_loss_from_history(
+            history_payload=history_payload,
+            account=account,
+            monitor_card=monitor_card,
+            logger=logger,
+        )
         await self.monitor.sync_round_progress(
             monitor_card,
             completed_rounds=synced_completed_rounds,
@@ -6552,6 +6559,128 @@ class AutoswapBot:
                     reason="progress",
                 )
         return synced_completed_rounds
+
+    async def _update_cycle_loss_from_history(
+        self,
+        *,
+        history_payload: Any,
+        account: AccountConfig,
+        monitor_card,
+        logger: AccountLoggerAdapter,
+    ) -> None:
+        """Hitung cycle loss dari trading history hari ini.
+
+        Logic:
+        - Mode CC: cari pasangan CC→foreign + foreign→CC, hitung loss = CC_out - CC_in
+        - Mode USDCx: cari pasangan USDCx→CBTC + CBTC→USDCx, hitung loss = USDCx_out - USDCx_in
+
+        Setiap pasangan yang ditemukan = 1 round cycle.
+        Total loss diakumulasikan ke card.total_cycle_spread_loss.
+        """
+        if monitor_card is None or history_payload is None:
+            return
+
+        loss_symbol = self._effective_post_target_refill_symbol()
+        items = self._extract_trading_history_items(history_payload)
+        if not items:
+            return
+
+        today_utc = datetime.now(timezone.utc).date()
+        today_items = []
+        for item in items:
+            ts = self._extract_item_timestamp(item)
+            if ts is None or ts.date() != today_utc:
+                continue
+            if self._is_failed_history_item(item):
+                continue
+            sell_sym = self._history_symbol(item.get("token_input_instrument_id"))
+            buy_sym = self._history_symbol(item.get("token_output_instrument_id"))
+            if sell_sym is None or buy_sym is None:
+                continue
+            try:
+                amount_in = Decimal(str(item.get("amount_input", "0")))
+                amount_out = Decimal(str(item.get("amount_output", "0")))
+            except Exception:
+                continue
+            today_items.append({
+                "sell": sell_sym,
+                "buy": buy_sym,
+                "amount_in": amount_in,
+                "amount_out": amount_out,
+                "ts": ts,
+            })
+
+        if not today_items:
+            return
+
+        # Urutkan dari terlama ke terbaru
+        today_items.sort(key=lambda x: x["ts"])
+
+        # Hitung cycle loss dengan matching open/close
+        total_loss = Decimal("0")
+        cycle_count = 0
+
+        if loss_symbol == "USDCx":
+            # Mode USDCx: USDCx→CBTC (open) + CBTC→USDCx (close)
+            pending_open: Decimal | None = None
+            for swap in today_items:
+                if swap["sell"] == "USDCx" and swap["buy"] == "CBTC":
+                    # Open cycle: catat USDCx yang keluar
+                    pending_open = swap["amount_in"]
+                elif swap["sell"] == "CBTC" and swap["buy"] == "USDCx" and pending_open is not None:
+                    # Close cycle: hitung loss
+                    usdcx_in = swap["amount_out"]
+                    loss = pending_open - usdcx_in
+                    total_loss += loss
+                    cycle_count += 1
+                    logger.info(
+                        "[CYLOSS-HIST] USDCx cycle: out=%s → in=%s | loss=%s",
+                        pending_open,
+                        usdcx_in,
+                        loss,
+                    )
+                    pending_open = None
+        else:
+            # Mode CC: CC→foreign (open) + foreign→CC (close)
+            pending_open = None
+            pending_foreign = None
+            for swap in today_items:
+                if swap["sell"] == CC_SYMBOL and swap["buy"] in ("USDCx", "CBTC"):
+                    # Open cycle: catat CC yang keluar
+                    pending_open = swap["amount_in"]
+                    pending_foreign = swap["buy"]
+                elif (
+                    pending_open is not None
+                    and swap["sell"] == pending_foreign
+                    and swap["buy"] == CC_SYMBOL
+                ):
+                    # Close cycle: hitung loss
+                    cc_in = swap["amount_out"]
+                    loss = pending_open - cc_in
+                    total_loss += loss
+                    cycle_count += 1
+                    logger.info(
+                        "[CYLOSS-HIST] CC cycle: out=%s → in=%s | loss=%s",
+                        pending_open,
+                        cc_in,
+                        loss,
+                    )
+                    pending_open = None
+                    pending_foreign = None
+
+        if cycle_count > 0:
+            # Update card dengan total loss dari history
+            monitor_card.total_cycle_spread_loss[loss_symbol] = total_loss
+            monitor_card.cycle_count = cycle_count
+            monitor_card.daily_cc_loss = total_loss
+            monitor_card.daily_cc_loss_set = True
+            monitor_card.daily_loss_symbol = loss_symbol
+            logger.info(
+                "[CYLOSS-HIST] Total cycle loss hari ini: %s=%s (%s cycles)",
+                loss_symbol,
+                total_loss,
+                cycle_count,
+            )
 
     async def _sleep_or_stop(self, seconds: float) -> None:
         if seconds <= 0:
