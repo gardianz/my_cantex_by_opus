@@ -33,6 +33,7 @@ from .runtime_state import BotRuntimeStateStore, DailyFreeFeeStatus
 from .sdk_ext import ExtendedCantexSDK
 from .cycle_tracker import CycleTracker, CycleResult
 from .fee_scraper import FeeScraper
+from .price_validator import PriceValidator, ExecutionPriceRecord
 from .telegram_monitor import TelegramCardState, TelegramCommand, TelegramMonitor
 
 
@@ -116,6 +117,8 @@ class AutoswapBot:
         self._cycle_trackers: dict[str, CycleTracker] = {}
         self.fee_scraper = FeeScraper()
         self._account_party_ids: dict[str, str] = {}  # account_name -> party_id
+        # Price validator per akun: validasi harga quote vs execution price terakhir
+        self._price_validators: dict[str, PriceValidator] = {}
         # Map account_name -> TelegramCardState aktif. Dipakai oleh callback
         # FeeScraper.on_result supaya periodic loop bisa merefresh card.
         self._monitor_cards_by_account: dict[str, TelegramCardState] = {}
@@ -152,6 +155,16 @@ class AutoswapBot:
             self._cycle_trackers[account_name] = tracker
 
         return self._cycle_trackers[account_name]
+
+    def _get_price_validator(self, account_name: str) -> PriceValidator:
+        """Get or create PriceValidator untuk akun."""
+        if account_name not in self._price_validators:
+            self._price_validators[account_name] = PriceValidator(
+                tolerance_pct=Decimal("0.01"),  # 1% default
+                max_retries=3,
+                retry_delay_seconds=3.0,
+            )
+        return self._price_validators[account_name]
 
     def _on_fee_scrape_result(self, account_name: str, result) -> None:
         """Callback dipanggil FeeScraper saat ada result.success baru.
@@ -2053,6 +2066,7 @@ class AutoswapBot:
                 allow_network_fee_cap_bypass=(
                     daily_free_fee_status is not None and hop_index == 1
                 ),
+                account_name=account.name,
             )
             if tx_result is None:
                 await self.monitor.log_event(
@@ -2613,6 +2627,7 @@ class AutoswapBot:
                 allow_network_fee_cap_bypass=(
                     daily_free_fee_status is not None and hop_index == 1
                 ),
+                account_name=account.name,
             )
             if tx_result is None:
                 await self.monitor.log_event(
@@ -3797,6 +3812,7 @@ class AutoswapBot:
         monitor_card: TelegramCardState | None,
         free_fee_sequential_account_name: str | None = None,
         allow_network_fee_cap_bypass: bool = False,
+        account_name: str | None = None,
     ) -> tuple[dict[str, Any] | None, str | None]:
         # Timeout konfirmasi swap: max(estimated_time * 4, min_timeout_dari_config)
         # Default minimum 90 detik, bisa diubah via swap_confirmation_timeout_seconds di config.
@@ -3887,6 +3903,94 @@ class AutoswapBot:
                     force=True,
                 )
                 return None, "SLIPPAGE_ABOVE_LIMIT"
+
+            # --- Price validation vs execution price terakhir dari trading history ---
+            if account_name is not None:
+                price_validator = self._get_price_validator(account_name)
+                # Hitung quote price: output/input ratio
+                if hop.sell_amount > Decimal("0") and hop.returned_amount > Decimal("0"):
+                    quote_price = hop.returned_amount / hop.sell_amount
+                    sell_sym = hop.sell_symbol
+                    buy_sym = hop.buy_symbol
+
+                    # Cek peluang arbitrase untuk CBTC→USDCx
+                    is_arb, arb_reason = price_validator.is_arbitrage_opportunity(
+                        sell_sym, buy_sym, quote_price
+                    )
+                    if is_arb:
+                        logger.info(
+                            "[PRICE] Hop %s/%s %s->%s: arbitrage bypass | %s",
+                            hop_index, hop_total, sell_sym, buy_sym, arb_reason,
+                        )
+                        self._schedule_monitor_call(
+                            self.monitor.log_event(
+                                monitor_card,
+                                f"[price] Hop {hop_index}/{hop_total} {sell_sym}->{buy_sym}: arbitrage bypass",
+                            ),
+                            logger=logger,
+                            description="price arb log",
+                        )
+                    else:
+                        # Validasi harga vs referensi
+                        is_valid, price_reason = price_validator.validate_quote_price(
+                            sell_sym, buy_sym, quote_price
+                        )
+                        if not is_valid:
+                            logger.warning(
+                                "[PRICE] Hop %s/%s %s->%s: harga di luar toleransi | %s | quote=%s",
+                                hop_index, hop_total, sell_sym, buy_sym, price_reason, quote_price,
+                            )
+                            self._schedule_monitor_call(
+                                self.monitor.log_event(
+                                    monitor_card,
+                                    f"[price] Hop {hop_index}/{hop_total} {sell_sym}->{buy_sym}: {price_reason}",
+                                ),
+                                logger=logger,
+                                description="price validation log",
+                            )
+                            # Retry quote sampai 3x
+                            price_retry_ok = False
+                            for price_retry in range(1, price_validator.max_retries + 1):
+                                await asyncio.sleep(price_validator.retry_delay_seconds)
+                                try:
+                                    retry_quote = await sdk.get_swap_quote(
+                                        sell_amount=hop.sell_amount,
+                                        sell_instrument=hop.raw_quote.sell_instrument,
+                                        buy_instrument=hop.raw_quote.buy_instrument,
+                                    )
+                                    retry_price = retry_quote.returned.amount / hop.sell_amount if hop.sell_amount > Decimal("0") else Decimal("0")
+                                    retry_valid, retry_reason = price_validator.validate_quote_price(
+                                        sell_sym, buy_sym, retry_price
+                                    )
+                                    logger.info(
+                                        "[PRICE] Retry %s/%s hop %s/%s %s->%s: price=%s | %s",
+                                        price_retry, price_validator.max_retries,
+                                        hop_index, hop_total, sell_sym, buy_sym,
+                                        retry_price, retry_reason,
+                                    )
+                                    if retry_valid:
+                                        price_retry_ok = True
+                                        break
+                                except Exception as exc:
+                                    logger.debug("[PRICE] Retry quote error: %s", exc)
+                            if not price_retry_ok:
+                                logger.warning(
+                                    "[PRICE] Hop %s/%s %s->%s: bypass setelah %s retry (harga masih di luar toleransi)",
+                                    hop_index, hop_total, sell_sym, buy_sym, price_validator.max_retries,
+                                )
+                                self._schedule_monitor_call(
+                                    self.monitor.log_event(
+                                        monitor_card,
+                                        f"[price] Hop {hop_index}/{hop_total} {sell_sym}->{buy_sym}: bypass setelah {price_validator.max_retries}x retry",
+                                    ),
+                                    logger=logger,
+                                    description="price bypass log",
+                                )
+                        else:
+                            logger.debug(
+                                "[PRICE] Hop %s/%s %s->%s: OK | %s",
+                                hop_index, hop_total, sell_sym, buy_sym, price_reason,
+                            )
 
             # Re-quote tepat sebelum submit untuk cek fee/slippage terkini.
             fresh_fee_amount = effective_preflight_fee
@@ -3989,6 +4093,39 @@ class AutoswapBot:
             )
 
             await self.monitor.record_tx_success(monitor_card)
+            # Update price validator dengan execution price aktual dari event
+            if account_name is not None:
+                try:
+                    input_amount = getattr(event, "input_amount", None)
+                    output_amount = getattr(event, "output_amount", None)
+                    if input_amount is not None and output_amount is not None:
+                        input_dec = Decimal(str(input_amount))
+                        output_dec = Decimal(str(output_amount))
+                        if input_dec > Decimal("0"):
+                            exec_price = output_dec / input_dec
+                            price_validator = self._get_price_validator(account_name)
+                            from .price_validator import ExecutionPriceRecord
+                            import time as _time
+                            record = ExecutionPriceRecord(
+                                sell_symbol=hop.sell_symbol,
+                                buy_symbol=hop.buy_symbol,
+                                trade_price=exec_price,
+                                amount_in=input_dec,
+                                amount_out=output_dec,
+                                timestamp_utc="",
+                                update_id=getattr(event, "event_id", ""),
+                            )
+                            price_validator._last_execution[
+                                price_validator._pair_key(hop.sell_symbol, hop.buy_symbol)
+                            ] = record
+                            logger.info(
+                                "[PRICE] Execution price updated after swap: %s->%s | price=%s",
+                                hop.sell_symbol,
+                                hop.buy_symbol,
+                                exec_price,
+                            )
+                except Exception as exc:
+                    logger.debug("[PRICE] Gagal update execution price: %s", exc)
             return (
                 {
                     "id": getattr(event, "event_id", ""),
@@ -5050,6 +5187,7 @@ class AutoswapBot:
                     round_number=0,
                     logger=logger,
                     monitor_card=monitor_card,
+                    account_name=account.name,
                 )
                 if tx_result is None:
                     recovery_failed = True
@@ -6569,6 +6707,15 @@ class AutoswapBot:
         monitor_card,
         logger: AccountLoggerAdapter,
     ) -> None:
+        # Juga update price validator dari history
+        price_validator = self._get_price_validator(account.name)
+        updated = price_validator.update_from_history_payload(history_payload, CC_SYMBOL)
+        if updated > 0:
+            logger.debug(
+                "Price validator updated from history: %s items | pairs=%s",
+                updated,
+                list(price_validator.get_summary().keys()),
+            )
         """Hitung cycle loss dari trading history hari ini.
 
         Berdasarkan struktur API /v1/history/trading yang sebenarnya:
