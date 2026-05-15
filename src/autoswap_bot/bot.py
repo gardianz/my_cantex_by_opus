@@ -5207,13 +5207,23 @@ class AutoswapBot:
                     result=result,
                 )
                 return
-            # Simpan balance sebelum round untuk cycle loss calculation
+            # Simpan balance sebelum round untuk cycle loss calculation.
+            # Ambil langsung dari API agar akurat (bukan dari cache monitor_card).
             _loss_symbol = self._effective_post_target_refill_symbol()
-            _balance_before_round = (
-                monitor_card.balances.get(_loss_symbol, Decimal("0"))
-                if monitor_card is not None
-                else Decimal("0")
-            )
+            _balance_before_round = Decimal("0")
+            try:
+                _info_before = await sdk.get_account_info()
+                _balances_before = self._balances_by_symbol(_info_before)
+                _balance_before_round = _balances_before.get(_loss_symbol, Decimal("0"))
+                await self.monitor.update_balances(monitor_card, _balances_before)
+                logger.debug(
+                    "Cycle loss snapshot before round: %s=%s",
+                    _loss_symbol,
+                    _balance_before_round,
+                )
+            except Exception as exc:
+                logger.debug("Gagal ambil balance sebelum round: %s", exc)
+
             _rounds_before = result.completed_rounds
             result.completed_rounds = await self._wait_for_trading_history_round_progress(
                 sdk=sdk,
@@ -5225,31 +5235,44 @@ class AutoswapBot:
             )
             result.swap_transactions = result.completed_rounds
             # Hitung cycle loss jika ada round baru yang selesai
+            logger.info(
+                "[CYLOSS] rounds_before=%s rounds_after=%s balance_before=%s symbol=%s",
+                _rounds_before,
+                result.completed_rounds,
+                _balance_before_round,
+                _loss_symbol,
+            )
             if result.completed_rounds > _rounds_before and monitor_card is not None:
-                # Ambil balance terkini setelah round selesai
                 try:
                     _info_after = await sdk.get_account_info()
                     _balances_after = self._balances_by_symbol(_info_after)
                     await self.monitor.update_balances(monitor_card, _balances_after)
                     _balance_after_round = _balances_after.get(_loss_symbol, Decimal("0"))
-                    if _balance_before_round > Decimal("0"):
-                        await self.monitor.record_round_cycle_loss(
-                            monitor_card,
-                            loss_symbol=_loss_symbol,
-                            balance_before=_balance_before_round,
-                            balance_after=_balance_after_round,
-                        )
-                        logger.info(
-                            "Cycle loss round %s: %s_before=%s | %s_after=%s | loss=%s",
-                            result.completed_rounds,
-                            _loss_symbol,
-                            _balance_before_round,
-                            _loss_symbol,
-                            _balance_after_round,
-                            _balance_before_round - _balance_after_round,
-                        )
+                    logger.info(
+                        "[CYLOSS] round %s selesai: %s_before=%s | %s_after=%s | loss=%s",
+                        result.completed_rounds,
+                        _loss_symbol,
+                        _balance_before_round,
+                        _loss_symbol,
+                        _balance_after_round,
+                        _balance_before_round - _balance_after_round,
+                    )
+                    # Selalu catat cycle loss, bahkan jika balance_before = 0
+                    # (akan menghasilkan nilai negatif jika balance naik)
+                    await self.monitor.record_round_cycle_loss(
+                        monitor_card,
+                        loss_symbol=_loss_symbol,
+                        balance_before=_balance_before_round,
+                        balance_after=_balance_after_round,
+                    )
                 except Exception as exc:
-                    logger.debug("Gagal hitung cycle loss round: %s", exc)
+                    logger.warning("[CYLOSS] Gagal hitung cycle loss round: %s", exc)
+            else:
+                logger.info(
+                    "[CYLOSS] Tidak ada round baru (rounds_before=%s == rounds_after=%s), skip cycle loss",
+                    _rounds_before,
+                    result.completed_rounds,
+                )
             self._persist_round_session_progress(
                 account=account,
                 prepared_run=prepared_run,
