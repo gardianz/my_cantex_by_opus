@@ -137,6 +137,7 @@ Struktur dasarnya:
 ```toml
 [settings]
 swap_delay_seconds = { min = 20.0, max = 100.0 }
+pre_submit_requote_enabled = true
 max_network_fee_cc_per_execution = "0.12"
 max_slippage_per_execution = "0.001"
 network_fee_poll_seconds = { min = 20.0, max = 40.0 }
@@ -172,6 +173,12 @@ auto_create_intent_account = true
 - `swap_delay_seconds`
   - Delay antar swap pada mode normal
   - Bisa angka tetap atau range `{ min, max }`
+
+- `pre_submit_requote_enabled`
+  - Jika `true`, bot akan melakukan 1x re-quote tepat sebelum submit swap
+  - Re-quote ini dipakai untuk refresh fee dan slippage terakhir sebelum transaksi dikirim
+  - Jika `false`, bot tetap memakai quote awal yang dibawa dari route / preflight
+  - Setting ini hanya mematikan re-quote final sebelum submit; route selection, polling fee, dan retry quote lain tetap berjalan
 
 - `max_network_fee_cc_per_execution`
   - Batas maksimum network fee untuk setiap transaksi swap / hop dalam satuan `CC`
@@ -260,6 +267,9 @@ Command yang tersedia:
   - Mengubah target rounds semua akun menjadi nilai tetap.
 - `/set rounds 24 28`
   - Mengubah target rounds semua akun menjadi range.
+- `/set pre_submit_requote on`
+  - Mengaktifkan atau mematikan re-quote terakhir sebelum submit swap.
+  - Nilai yang diterima: `on/off`, `true/false`, `yes/no`.
 
 Catatan: perubahan dari Telegram berlaku untuk runtime proses yang sedang berjalan dan tidak menulis ulang `config/accounts.toml`.
 

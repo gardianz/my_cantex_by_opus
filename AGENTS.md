@@ -140,13 +140,19 @@ Nilainya memakai angka mentah dari SDK:
 1. Router quote semua candidate route
 2. route dengan fee/slippage di atas cap dihindari jika ada alternatif
 3. saat preflight sebelum submit, hop dicek lagi terhadap fee/slippage dari quote yang sedang dibawa
-4. bot re-quote tepat sebelum submit
+4. jika `pre_submit_requote_enabled = true`, bot re-quote tepat sebelum submit
 5. jika fee atau slippage terbaru melewati cap, hop dibatalkan
 
 Artinya guard dilakukan dua kali:
 
 - saat memilih route
 - saat preflight final sebelum submit
+
+Kalau `pre_submit_requote_enabled = false`:
+
+- bot tetap memakai cek fee/slippage dari quote awal
+- bot tidak refresh quote final sebelum submit
+- polling fee route-level dan quote retry lain tetap berjalan
 
 ### Batasan saat ini
 
@@ -277,3 +283,26 @@ Saat menambah jalur scrape baru atau merubah strategi rate-limit:
 - Saldo `CC` dan `USDCx` di terminal dashboard maupun di Telegram combined card sekarang ditampilkan dengan 2 desimal (`14.32`, `11.53`). `CBTC` tetap 8 desimal.
 - Lebar kolom dashboard di `TelegramMonitor._dashboard_col_widths` di-tune ulang untuk memuat: nama akun 10 char (mis. `wallet-15`), `Plan` 22 char, `Gas` 10 char, `CyLoss` 14 char, plus margin.
 - Saat menambah/mengubah kolom dashboard, jaga konsistensi tuple `_dashboard_col_widths` dan urutan tuple di `_dashboard_table_lines`.
+
+## 13. Re-quote final sebelum submit bisa dimatikan
+
+Re-quote final sebelum `swap_and_confirm` dikontrol oleh `settings.pre_submit_requote_enabled`.
+
+Tujuannya:
+
+- `true`: user ingin proteksi tambahan dengan refresh quote terakhir sebelum submit
+- `false`: user ingin submit lebih cepat dan konsisten memakai quote awal
+
+Perilaku:
+
+- `true`
+  - bot ambil `fresh_quote` terakhir sebelum submit
+  - fee/slippage final memakai nilai fresh quote itu
+- `false`
+  - bot lewati langkah `fresh_quote`
+  - fee/slippage final tetap memakai quote awal dari `hop`
+
+Catatan maintenance:
+
+- setting ini hanya berlaku di `_swap_hop_with_retry`
+- jangan dipakai untuk mematikan polling fee route-level atau retry quote untuk validasi harga

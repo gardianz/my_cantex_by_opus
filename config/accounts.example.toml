@@ -6,6 +6,7 @@ base_url = "https://api.cantex.io"
 execution_mode = "sequential"
 max_concurrency = 1
 swap_delay_seconds = { min = 1.0, max = 1.0 }
+pre_submit_requote_enabled = true            # Re-quote terakhir sebelum submit swap
 
 # Fee control
 max_network_fee_cc_per_execution = "0.36"    # Max fee per swap (CC)

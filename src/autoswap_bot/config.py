@@ -184,6 +184,7 @@ class RuntimeConfig:
     execution_mode: str
     max_concurrency: int
     swap_delay_seconds_range: FloatRange
+    pre_submit_requote_enabled: bool
     max_network_fee_cc_per_execution: Decimal | None
     max_slippage_per_execution: Decimal | None
     fee_stability_enabled: bool
@@ -297,6 +298,7 @@ def load_config(path: str | Path) -> BotConfig:
             settings.get("swap_delay_seconds", 2.0),
             "settings.swap_delay_seconds",
         ),
+        pre_submit_requote_enabled=bool(settings.get("pre_submit_requote_enabled", True)),
         max_network_fee_cc_per_execution=(
             _to_decimal(
                 settings.get("max_network_fee_cc_per_execution"),

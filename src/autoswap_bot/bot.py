@@ -323,6 +323,7 @@ class AutoswapBot:
                 "/set rounds 26",
                 "/set rounds 24 28",
                 "/set max_slippage 0.001  (0.001 = 0.1%, none = nonaktif)",
+                "/set pre_submit_requote on  (on/off, true/false, yes/no)",
                 "/set price_tolerance 0.01  (0.01 = 1%)",
                 "",
                 "Catatan: perubahan berlaku runtime dan tidak menulis ulang file config.",
@@ -357,6 +358,11 @@ class AutoswapBot:
                     else "max_slippage_per_execution: -"
                 ),
                 (
+                    "pre_submit_requote_enabled: on"
+                    if runtime.pre_submit_requote_enabled
+                    else "pre_submit_requote_enabled: off"
+                ),
+                (
                     "fee_fast_poll_range: "
                     f"{fast_range[0]}..{fast_range[1]}"
                     if fast_range is not None
@@ -383,6 +389,8 @@ class AutoswapBot:
                 return self._telegram_set_network_fee_poll_seconds(values)
             if key == "rounds":
                 return self._telegram_set_rounds(values)
+            if key in {"pre_submit_requote_enabled", "pre_submit_requote", "requote", "re_quote"}:
+                return self._telegram_set_pre_submit_requote(values)
             if key in {"max_slippage_per_execution", "max_slippage", "slippage"}:
                 return self._telegram_set_max_slippage(values)
             if key in {"price_tolerance", "price_validation_tolerance_pct", "price_tol"}:
@@ -392,7 +400,7 @@ class AutoswapBot:
         return (
             "❌ Key tidak didukung. Key yang tersedia:\n"
             "max_network_fee_cc_per_execution, fee_fast_poll_range, "
-            "network_fee_poll_seconds, rounds, max_slippage, price_tolerance"
+            "network_fee_poll_seconds, rounds, pre_submit_requote, max_slippage, price_tolerance"
         )
 
     def _telegram_set_max_network_fee(self, values: list[str]) -> str:
@@ -409,6 +417,17 @@ class AutoswapBot:
         object.__setattr__(self.config.runtime, "max_network_fee_cc_per_execution", parsed)
         self._sync_route_optimizer_fee_cap(parsed)
         return f"✅ max_network_fee_cc_per_execution = {parsed} CC"
+
+    def _telegram_set_pre_submit_requote(self, values: list[str]) -> str:
+        if len(values) != 1:
+            raise ValueError("Format: /set pre_submit_requote on|off")
+        enabled = self._parse_telegram_bool_flag(values[0], "pre_submit_requote")
+        object.__setattr__(self.config.runtime, "pre_submit_requote_enabled", enabled)
+        return (
+            "✅ pre_submit_requote_enabled = on"
+            if enabled
+            else "✅ pre_submit_requote_enabled = off"
+        )
 
     def _telegram_set_max_slippage(self, values: list[str]) -> str:
         """Set max_slippage_per_execution via Telegram.
@@ -514,6 +533,14 @@ class AutoswapBot:
         if min_value > max_value:
             raise ValueError(f"{field_name}.min tidak boleh lebih besar dari .max")
         return min_value, max_value
+
+    def _parse_telegram_bool_flag(self, value: str, field_name: str) -> bool:
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "on", "yes", "y"}:
+            return True
+        if normalized in {"0", "false", "off", "no", "n"}:
+            return False
+        raise ValueError(f"Format: /set {field_name} on|off")
 
     def _parse_telegram_float_range(
         self,
@@ -3895,6 +3922,7 @@ class AutoswapBot:
             await self._pause_if_requested()
             fee_cap = self.config.runtime.max_network_fee_cc_per_execution
             slippage_cap = self.config.runtime.max_slippage_per_execution
+            pre_submit_requote_enabled = self.config.runtime.pre_submit_requote_enabled
             effective_preflight_fee = (
                 hop.network_fee_amount
                 if hop.network_fee_symbol == CC_SYMBOL
@@ -4060,12 +4088,15 @@ class AutoswapBot:
             fresh_fee_amount = effective_preflight_fee
             fresh_slippage = hop.slippage
             if (
-                (
-                    fee_cap is not None
-                    and not allow_network_fee_cap_bypass
-                    and hop.network_fee_symbol == CC_SYMBOL
+                pre_submit_requote_enabled
+                and (
+                    (
+                        fee_cap is not None
+                        and not allow_network_fee_cap_bypass
+                        and hop.network_fee_symbol == CC_SYMBOL
+                    )
+                    or slippage_cap is not None
                 )
-                or slippage_cap is not None
             ):
                 try:
                     fresh_quote = await sdk.get_swap_quote(
@@ -4143,6 +4174,13 @@ class AutoswapBot:
                         round_number,
                         re_quote_exc,
                     )
+            elif not pre_submit_requote_enabled:
+                logger.info(
+                    "Re-quote sebelum submit nonaktif untuk hop %s/%s round %s; memakai quote awal",
+                    hop_index,
+                    hop_total,
+                    round_number,
+                )
 
             event = await sdk.swap_and_confirm(
                 sell_amount=hop.sell_amount,
