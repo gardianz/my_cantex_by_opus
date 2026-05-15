@@ -6583,7 +6583,20 @@ class AutoswapBot:
         loss_symbol = self._effective_post_target_refill_symbol()
         items = self._extract_trading_history_items(history_payload)
         if not items:
+            logger.info("[CYLOSS-HIST] Tidak ada item di trading history")
             return
+
+        # Log item pertama untuk debug field names
+        first_item = items[0]
+        if isinstance(first_item, dict):
+            logger.info(
+                "[CYLOSS-HIST] Sample item keys: %s",
+                list(first_item.keys()),
+            )
+            logger.info(
+                "[CYLOSS-HIST] Sample item: %s",
+                {k: v for k, v in list(first_item.items())[:15]},
+            )
 
         today_utc = datetime.now(timezone.utc).date()
         today_items = []
@@ -6593,13 +6606,40 @@ class AutoswapBot:
                 continue
             if self._is_failed_history_item(item):
                 continue
-            sell_sym = self._history_symbol(item.get("token_input_instrument_id"))
-            buy_sym = self._history_symbol(item.get("token_output_instrument_id"))
+            # Coba berbagai field name yang mungkin ada di API
+            sell_sym = (
+                self._history_symbol(item.get("token_input_instrument_id"))
+                or self._history_symbol(item.get("input_instrument_id"))
+                or self._history_symbol(item.get("sell_instrument_id"))
+                or self._history_symbol(item.get("from_instrument_id"))
+            )
+            buy_sym = (
+                self._history_symbol(item.get("token_output_instrument_id"))
+                or self._history_symbol(item.get("output_instrument_id"))
+                or self._history_symbol(item.get("buy_instrument_id"))
+                or self._history_symbol(item.get("to_instrument_id"))
+            )
             if sell_sym is None or buy_sym is None:
+                logger.debug(
+                    "[CYLOSS-HIST] Skip item: sell_sym=%s buy_sym=%s keys=%s",
+                    sell_sym,
+                    buy_sym,
+                    list(item.keys()) if isinstance(item, dict) else "?",
+                )
                 continue
             try:
-                amount_in = Decimal(str(item.get("amount_input", "0")))
-                amount_out = Decimal(str(item.get("amount_output", "0")))
+                amount_in = Decimal(str(
+                    item.get("amount_input")
+                    or item.get("input_amount")
+                    or item.get("sell_amount")
+                    or "0"
+                ))
+                amount_out = Decimal(str(
+                    item.get("amount_output")
+                    or item.get("output_amount")
+                    or item.get("buy_amount")
+                    or "0"
+                ))
             except Exception:
                 continue
             today_items.append({
