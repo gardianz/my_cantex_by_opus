@@ -4051,7 +4051,7 @@ class AutoswapBot:
                                     description="price bypass log",
                                 )
                         else:
-                            logger.debug(
+                            logger.info(
                                 "[PRICE] Hop %s/%s %s->%s: OK | %s",
                                 hop_index, hop_total, sell_sym, buy_sym, price_reason,
                             )
