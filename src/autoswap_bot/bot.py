@@ -6578,10 +6578,20 @@ class AutoswapBot:
         Total loss diakumulasikan ke card.total_cycle_spread_loss.
         """
         if monitor_card is None or history_payload is None:
+            logger.info("[CYLOSS-HIST] Skip: monitor_card=%s payload=%s", monitor_card is not None, history_payload is not None)
             return
 
         loss_symbol = self._effective_post_target_refill_symbol()
+        logger.info("[CYLOSS-HIST] loss_symbol=%s payload_type=%s", loss_symbol, type(history_payload).__name__)
+
+        # Log raw payload structure
+        if isinstance(history_payload, dict):
+            logger.info("[CYLOSS-HIST] payload keys: %s", list(history_payload.keys()))
+        elif isinstance(history_payload, list):
+            logger.info("[CYLOSS-HIST] payload is list, len=%s", len(history_payload))
+
         items = self._extract_trading_history_items(history_payload)
+        logger.info("[CYLOSS-HIST] extracted items count: %s", len(items))
         if not items:
             logger.info("[CYLOSS-HIST] Tidak ada item di trading history")
             return
