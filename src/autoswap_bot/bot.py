@@ -6524,17 +6524,18 @@ class AutoswapBot:
             requested_rounds=prepared_run.rounds,
             completed_rounds=synced_completed_rounds,
         )
-        # Hitung cycle loss dari trading history
+        await self.monitor.sync_round_progress(
+            monitor_card,
+            completed_rounds=synced_completed_rounds,
+            force=force_log,
+        )
+        # Hitung cycle loss dari trading history SETELAH sync_round_progress
+        # agar _rollover_card_if_needed tidak mereset data yang baru diisi
         await self._update_cycle_loss_from_history(
             history_payload=history_payload,
             account=account,
             monitor_card=monitor_card,
             logger=logger,
-        )
-        await self.monitor.sync_round_progress(
-            monitor_card,
-            completed_rounds=synced_completed_rounds,
-            force=force_log,
         )
         if force_log or synced_completed_rounds != previous_completed_rounds:
             logger.info(
