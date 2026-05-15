@@ -157,10 +157,14 @@ class AutoswapBot:
         return self._cycle_trackers[account_name]
 
     def _get_price_validator(self, account_name: str) -> PriceValidator:
-        """Get or create PriceValidator untuk akun."""
+        """Get or create PriceValidator untuk akun.
+
+        Toleransi diambil dari config runtime (price_validation_tolerance_pct).
+        Bisa di-override via Telegram /set price_tolerance.
+        """
         if account_name not in self._price_validators:
             self._price_validators[account_name] = PriceValidator(
-                tolerance_pct=Decimal("0.01"),  # 1% default
+                tolerance_pct=self.config.runtime.price_validation_tolerance_pct,
                 max_retries=3,
                 retry_delay_seconds=3.0,
             )
@@ -318,6 +322,8 @@ class AutoswapBot:
                 "/set network_fee_poll_seconds 5 10",
                 "/set rounds 26",
                 "/set rounds 24 28",
+                "/set max_slippage 0.001  (0.001 = 0.1%, none = nonaktif)",
+                "/set price_tolerance 0.01  (0.01 = 1%)",
                 "",
                 "Catatan: perubahan berlaku runtime dan tidak menulis ulang file config.",
             ]
@@ -338,15 +344,16 @@ class AutoswapBot:
             f"{account.name}={account.rounds_range.min_value}..{account.rounds_range.max_value}"
             for account in self.config.accounts
         )
+        slippage = runtime.max_slippage_per_execution
+        price_tol = runtime.price_validation_tolerance_pct
         return "\n".join(
             [
                 "<b>Status Bot</b>",
                 f"State: {status}",
                 f"max_network_fee_cc_per_execution: {fee_cap if fee_cap is not None else '-'}",
                 (
-                    "max_slippage_per_execution: "
-                    f"{runtime.max_slippage_per_execution}"
-                    if runtime.max_slippage_per_execution is not None
+                    f"max_slippage_per_execution: {slippage} ({slippage * 100:.3f}%)"
+                    if slippage is not None
                     else "max_slippage_per_execution: -"
                 ),
                 (
@@ -357,6 +364,7 @@ class AutoswapBot:
                 ),
                 f"network_fee_poll_seconds: {poll_range.min_value}..{poll_range.max_value}",
                 f"rounds: {account_rounds}",
+                f"price_validation_tolerance: {price_tol} ({price_tol * 100:.2f}%)",
             ]
         )
 
@@ -375,9 +383,17 @@ class AutoswapBot:
                 return self._telegram_set_network_fee_poll_seconds(values)
             if key == "rounds":
                 return self._telegram_set_rounds(values)
+            if key in {"max_slippage_per_execution", "max_slippage", "slippage"}:
+                return self._telegram_set_max_slippage(values)
+            if key in {"price_tolerance", "price_validation_tolerance_pct", "price_tol"}:
+                return self._telegram_set_price_tolerance(values)
         except (ArithmeticError, ValueError) as exc:
             return f"❌ {exc}"
-        return "❌ Key tidak didukung. Key: max_network_fee_cc_per_execution, fee_fast_poll_range, network_fee_poll_seconds, rounds."
+        return (
+            "❌ Key tidak didukung. Key yang tersedia:\n"
+            "max_network_fee_cc_per_execution, fee_fast_poll_range, "
+            "network_fee_poll_seconds, rounds, max_slippage, price_tolerance"
+        )
 
     def _telegram_set_max_network_fee(self, values: list[str]) -> str:
         if len(values) != 1:
@@ -393,6 +409,54 @@ class AutoswapBot:
         object.__setattr__(self.config.runtime, "max_network_fee_cc_per_execution", parsed)
         self._sync_route_optimizer_fee_cap(parsed)
         return f"✅ max_network_fee_cc_per_execution = {parsed} CC"
+
+    def _telegram_set_max_slippage(self, values: list[str]) -> str:
+        """Set max_slippage_per_execution via Telegram.
+
+        Format: /set max_slippage 0.001   (0.001 = 0.1%)
+                /set max_slippage none    (nonaktifkan)
+        """
+        if len(values) != 1:
+            raise ValueError("Format: /set max_slippage angka|none  (contoh: 0.001 = 0.1%)")
+        value = values[0].strip().lower()
+        if value in {"none", "off", "null", "-"}:
+            object.__setattr__(self.config.runtime, "max_slippage_per_execution", None)
+            # Sync ke semua route optimizer aktif
+            for router in list(self._active_route_optimizers):
+                router.set_max_slippage(None)
+            return "✅ max_slippage_per_execution dinonaktifkan."
+        parsed = Decimal(value)
+        if parsed <= 0:
+            raise ValueError("max_slippage_per_execution harus > 0")
+        if parsed > Decimal("1"):
+            raise ValueError("max_slippage_per_execution terlalu besar (max 1.0 = 100%)")
+        object.__setattr__(self.config.runtime, "max_slippage_per_execution", parsed)
+        # Sync ke semua route optimizer aktif
+        for router in list(self._active_route_optimizers):
+            router.set_max_slippage(parsed)
+        pct = parsed * 100
+        return f"✅ max_slippage_per_execution = {parsed} ({pct:.3f}%)"
+
+    def _telegram_set_price_tolerance(self, values: list[str]) -> str:
+        """Set price_validation_tolerance_pct via Telegram.
+
+        Format: /set price_tolerance 0.01   (0.01 = 1%)
+                /set price_tolerance 0.005  (0.5%)
+        """
+        if len(values) != 1:
+            raise ValueError("Format: /set price_tolerance angka  (contoh: 0.01 = 1%)")
+        value = values[0].strip().lower()
+        parsed = Decimal(value)
+        if parsed < Decimal("0"):
+            raise ValueError("price_tolerance tidak boleh negatif")
+        if parsed > Decimal("1"):
+            raise ValueError("price_tolerance terlalu besar (max 1.0 = 100%)")
+        object.__setattr__(self.config.runtime, "price_validation_tolerance_pct", parsed)
+        # Update semua price validator yang sudah ada
+        for validator in self._price_validators.values():
+            validator.tolerance_pct = parsed
+        pct = parsed * 100
+        return f"✅ price_validation_tolerance_pct = {parsed} ({pct:.3f}%)"
 
     def _sync_route_optimizer_fee_cap(self, value: Decimal | None) -> None:
         for router in list(self._active_route_optimizers):

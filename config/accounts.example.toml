@@ -47,6 +47,7 @@ default_continue_on_low_balance = true
 max_retries = 3
 retry_base_delay = 5.0
 swap_confirmation_timeout_seconds = 90    # Minimum timeout konfirmasi swap (detik). Default 90.
+price_validation_tolerance_pct = "0.01"  # Toleransi harga sebelum swap (0.01 = 1%). Bisa di-set via /set price_tolerance
 
 # Mode Withdraw — konfigurasi untuk mode 6 (withdraw CC ke alamat tujuan)
 # Aktifkan dengan memilih mode 6 saat startup, atau --mode withdraw

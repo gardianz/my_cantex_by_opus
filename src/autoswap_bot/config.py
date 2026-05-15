@@ -214,6 +214,7 @@ class RuntimeConfig:
     max_retries: int
     retry_base_delay: float
     swap_confirmation_timeout_seconds: float
+    price_validation_tolerance_pct: Decimal  # toleransi harga sebelum swap (0.01 = 1%)
     # Konfigurasi mode withdraw
     withdraw_target_address: str
     withdraw_saldo_sisa: Decimal
@@ -388,6 +389,10 @@ def load_config(path: str | Path) -> BotConfig:
         retry_base_delay=float(settings.get("retry_base_delay", 1.0)),
         swap_confirmation_timeout_seconds=float(
             settings.get("swap_confirmation_timeout_seconds", 90.0)
+        ),
+        price_validation_tolerance_pct=_to_decimal(
+            settings.get("price_validation_tolerance_pct", "0.01"),
+            "settings.price_validation_tolerance_pct",
         ),
         # Konfigurasi mode withdraw
         withdraw_target_address=str(settings.get("withdraw_target_address", "")),
