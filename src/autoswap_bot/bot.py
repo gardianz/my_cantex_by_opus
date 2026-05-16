@@ -1810,6 +1810,7 @@ class AutoswapBot:
                     refill_tx, balances, refill_satisfied = await self._refill_cc_for_source_step(
                         sdk=sdk,
                         router=router,
+                        account_name=account.name,
                         required_amount=amount_range.min_value,
                         cc_reserve=self._effective_cc_reserve(account),
                         logger=logger,
@@ -1916,6 +1917,7 @@ class AutoswapBot:
                     refill_tx, balances, refill_satisfied = await self._refill_cc_for_source_step(
                         sdk=sdk,
                         router=router,
+                        account_name=account.name,
                         required_amount=amount_range.min_value,
                         cc_reserve=self._effective_cc_reserve(account),
                         logger=logger,
@@ -2923,6 +2925,7 @@ class AutoswapBot:
         *,
         sdk: ExtendedCantexSDK,
         router: RouteOptimizer,
+        account_name: str,
         target_symbol: str,
         required_amount: Decimal,
         cc_reserve: Decimal,
@@ -2946,6 +2949,7 @@ class AutoswapBot:
             recovered_tx = await self._recover_to_symbol(
                 sdk=sdk,
                 router=router,
+                account_name=account_name,
                 target_symbol=target_symbol,
                 cc_reserve=cc_reserve,
                 logger=logger,
@@ -3033,6 +3037,7 @@ class AutoswapBot:
         *,
         sdk: ExtendedCantexSDK,
         router: RouteOptimizer,
+        account_name: str,
         required_amount: Decimal,
         cc_reserve: Decimal,
         logger: AccountLoggerAdapter,
@@ -3051,6 +3056,7 @@ class AutoswapBot:
         recovered_tx, balances, refill_satisfied = await self._recover_until_target_available(
             sdk=sdk,
             router=router,
+            account_name=account_name,
             target_symbol=CC_SYMBOL,
             required_amount=required_amount,
             cc_reserve=cc_reserve,
@@ -3154,6 +3160,7 @@ class AutoswapBot:
             recovered_tx = await self._recover_to_symbol(
                 sdk=sdk,
                 router=router,
+                account_name=result.account_name,
                 target_symbol=CC_SYMBOL,
                 cc_reserve=Decimal("0"),
                 logger=logger,
@@ -3217,6 +3224,7 @@ class AutoswapBot:
             recovered_tx = await self._recover_to_symbol(
                 sdk=sdk,
                 router=router,
+                account_name=result.account_name,
                 target_symbol=CC_SYMBOL,
                 cc_reserve=Decimal("0"),
                 logger=logger,
@@ -3316,6 +3324,7 @@ class AutoswapBot:
         recovered_tx = await self._recover_to_symbol(
             sdk=sdk,
             router=router,
+            account_name=account.name,
             target_symbol=CC_SYMBOL,
             cc_reserve=Decimal("0"),
             logger=logger,
@@ -3448,6 +3457,7 @@ class AutoswapBot:
             recovered_tx = await self._recover_to_symbol(
                 sdk=sdk,
                 router=router,
+                account_name=account.name,
                 target_symbol=target_symbol,
                 cc_reserve=Decimal("0"),
                 logger=logger,
@@ -5140,6 +5150,7 @@ class AutoswapBot:
         *,
         sdk: ExtendedCantexSDK,
         router: RouteOptimizer,
+        account_name: str,
         target_symbol: str,
         cc_reserve: Decimal,
         logger: AccountLoggerAdapter,
@@ -5289,7 +5300,7 @@ class AutoswapBot:
                     round_number=0,
                     logger=logger,
                     monitor_card=monitor_card,
-                    account_name=account.name,
+                    account_name=account_name,
                 )
                 if tx_result is None:
                     recovery_failed = True
@@ -5349,7 +5360,7 @@ class AutoswapBot:
                     balances_before=hop_balances_before,
                     balances_after=settled_balances,
                 )[0]
-                cycle_tracker = self._get_cycle_tracker(account.name)
+                cycle_tracker = self._get_cycle_tracker(account_name)
                 cycle_result = cycle_tracker.record_swap(
                     sell_symbol=hop.sell_symbol,
                     buy_symbol=hop.buy_symbol,
@@ -5387,7 +5398,7 @@ class AutoswapBot:
                             f"{cycle_result.end_amount} | loss={cycle_result.spread_loss}"
                         ),
                     )
-                    self._save_cycle_tracker_state(account.name)
+                    self._save_cycle_tracker_state(account_name)
                 await self._sleep_between_swaps()
             if recovery_failed:
                 continue
@@ -5472,6 +5483,7 @@ class AutoswapBot:
                 logger=logger,
                 monitor_card=monitor_card,
                 previous_completed_rounds=result.completed_rounds,
+                session_utc_date=_session_utc_date,
             )
             result.swap_transactions = result.completed_rounds
             # Hitung cycle loss jika ada round baru yang selesai
@@ -5620,6 +5632,7 @@ class AutoswapBot:
                     previous_completed_rounds=result.completed_rounds,
                     require_increment=True,
                     force_log=True,
+                    session_utc_date=_session_utc_date,
                 )
                 result.swap_transactions = result.completed_rounds
                 self._persist_round_session_progress(
@@ -5735,6 +5748,7 @@ class AutoswapBot:
                 logger=logger,
                 monitor_card=monitor_card,
                 previous_completed_rounds=result.completed_rounds,
+                session_utc_date=session_utc_date,
             )
             result.swap_transactions = result.completed_rounds
             self._persist_round_session_progress(
@@ -5869,6 +5883,7 @@ class AutoswapBot:
                     previous_completed_rounds=result.completed_rounds,
                     require_increment=True,
                     force_log=True,
+                    session_utc_date=session_utc_date,
                 )
                 result.swap_transactions = result.completed_rounds
                 self._persist_round_session_progress(
@@ -6076,6 +6091,11 @@ class AutoswapBot:
             result=result,
         )
         result.skipped_rounds = 0
+        await self.monitor.sync_round_progress(
+            monitor_card,
+            completed_rounds=0,
+            force=True,
+        )
 
         # Trigger monitor card rollover
         if monitor_card is not None:
@@ -6218,6 +6238,11 @@ class AutoswapBot:
             strategy_name=prepared_run.strategy_name,
             requested_rounds=prepared_run.rounds,
             completed_rounds=0,
+        )
+        await self.monitor.sync_round_progress(
+            monitor_card,
+            completed_rounds=0,
+            force=True,
         )
 
         # Trigger monitor card rollover
@@ -6596,6 +6621,7 @@ class AutoswapBot:
         require_increment: bool = False,
         force_log: bool = False,
         max_history_polls: int = 3,
+        session_utc_date: str | None = None,
     ) -> int:
         target_minimum = max(min(previous_completed_rounds, prepared_run.rounds), 0)
         if require_increment:
@@ -6605,6 +6631,20 @@ class AutoswapBot:
 
         poll_count = 0
         while True:
+            current_utc_date = datetime.now(timezone.utc).date().isoformat()
+            if session_utc_date is not None and current_utc_date != session_utc_date:
+                logger.info(
+                    "UTC day rollover saat menunggu trading history (%s -> %s); reset progress wait ke 0/%s",
+                    session_utc_date,
+                    current_utc_date,
+                    prepared_run.rounds,
+                )
+                await self.monitor.sync_round_progress(
+                    monitor_card,
+                    completed_rounds=0,
+                    force=True,
+                )
+                return 0
             if self._weekly_stop_due_utc():
                 logger.info(
                     "Weekly stop jatuh tempo saat menunggu trading history; keluar dari wait history"
@@ -6624,6 +6664,7 @@ class AutoswapBot:
                 monitor_card=monitor_card,
                 previous_completed_rounds=previous_completed_rounds,
                 force_log=force_log,
+                session_utc_date=session_utc_date,
             )
             if synced_completed_rounds is not None:
                 # Trigger ccview scrape setiap kali progress naik dari sebelumnya.
@@ -6706,8 +6747,17 @@ class AutoswapBot:
         monitor_card: TelegramCardState | None,
         previous_completed_rounds: int,
         force_log: bool = False,
+        session_utc_date: str | None = None,
     ) -> int | None:
-        fallback_completed_rounds = min(max(int(previous_completed_rounds), 0), prepared_run.rounds)
+        current_utc_date = datetime.now(timezone.utc).date().isoformat()
+        previous_progress_is_stale = (
+            session_utc_date is not None and current_utc_date != session_utc_date
+        )
+        fallback_completed_rounds = (
+            0
+            if previous_progress_is_stale
+            else min(max(int(previous_completed_rounds), 0), prepared_run.rounds)
+        )
         try:
             source_path, history_payload = await sdk.get_trading_history_payload()
         except Exception as exc:
@@ -6779,12 +6829,13 @@ class AutoswapBot:
         )
         if force_log or synced_completed_rounds != previous_completed_rounds:
             logger.info(
-                "Round sync | source=%s | trading_swap_today=%s | cached_today=%s | progress=%s/%s",
+                "Round sync | source=%s | trading_swap_today=%s | cached_today=%s | progress=%s/%s | stale_prev=%s",
                 source_path or "-",
                 history_today_count,
                 cached_history_count if cached_history_count is not None else "-",
                 synced_completed_rounds,
                 prepared_run.rounds,
+                "yes" if previous_progress_is_stale else "no",
             )
             await self.monitor.log_event(
                 monitor_card,
