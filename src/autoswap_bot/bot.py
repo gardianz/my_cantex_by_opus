@@ -61,6 +61,7 @@ class StrategyRuntimeState:
     consecutive_balance_blocked_rounds: int = 0
     strategy_4_topup_pending_recycle: bool = False
     strategy_4_topup_after_foreign_minimum: bool = False
+    strategy_4_topup_settlement_wait_retries: int = 0
     strategy_4_min_ticket_consecutive: int = 0
     strategy_4_min_ticket_blocked_pairs: set = field(default_factory=set)
 
@@ -87,6 +88,7 @@ class RoundExecutionResult:
 
 MAX_CONSECUTIVE_BALANCE_BLOCKED_ROUNDS = 5
 MAX_CONSECUTIVE_MIN_TICKET_RETRIES = 3
+MAX_STRATEGY_4_TOPUP_SETTLEMENT_WAIT_RETRIES = 3
 
 
 class AutoswapBot:
@@ -182,11 +184,9 @@ class AutoswapBot:
 
         async def _do_update() -> None:
             try:
-                await self.monitor.update_ccview_fee(
-                    card,
-                    validator_fee_total=result.validator_fee_total,
-                    validator_tx_count=result.validator_tx_count,
-                    avg_fee_per_swap=result.avg_fee_per_swap,
+                await self._apply_ccview_result_to_card(
+                    monitor_card=card,
+                    result=result,
                 )
             except Exception as exc:
                 self.log.debug(
@@ -204,6 +204,26 @@ class AutoswapBot:
                 "FeeScraper on_result skip create_task: tidak ada loop aktif | %s",
                 account_name,
             )
+
+    async def _apply_ccview_result_to_card(
+        self,
+        *,
+        monitor_card: TelegramCardState | None,
+        result,
+        force: bool = True,
+    ) -> None:
+        if monitor_card is None:
+            return
+        await self.monitor.update_ccview_fee(
+            monitor_card,
+            validator_fee_total=result.validator_fee_total,
+            validator_tx_count=result.validator_tx_count,
+            avg_fee_per_swap=result.avg_fee_per_swap,
+            week_validator_fee_total=result.week_validator_fee_total,
+            week_validator_tx_count=result.week_validator_tx_count,
+            week_avg_fee_per_swap=result.week_avg_fee_per_swap,
+            force=force,
+        )
 
     def _save_cycle_tracker_state(self, account_name: str) -> None:
         """Save cycle tracker state to runtime_state."""
@@ -1336,8 +1356,21 @@ class AutoswapBot:
             for symbol, amount in foreign_available.items()
         )
 
+        if not strategy_state.strategy_4_topup_pending_recycle:
+            strategy_state.strategy_4_topup_settlement_wait_retries = 0
+        elif has_foreign_balance:
+            strategy_state.strategy_4_topup_settlement_wait_retries = 0
+
         if strategy_state.strategy_4_topup_pending_recycle and not has_foreign_balance:
-            return [], "strategy_4 waiting top-up balance settlement"
+            strategy_state.strategy_4_topup_settlement_wait_retries += 1
+            if (
+                strategy_state.strategy_4_topup_settlement_wait_retries
+                <= MAX_STRATEGY_4_TOPUP_SETTLEMENT_WAIT_RETRIES
+            ):
+                return [], "strategy_4 waiting top-up balance settlement"
+            strategy_state.strategy_4_topup_pending_recycle = False
+            strategy_state.strategy_4_topup_after_foreign_minimum = False
+            strategy_state.strategy_4_topup_settlement_wait_retries = 0
 
         if strategy_state.reserve_recovery_active and not has_foreign_balance:
             strategy_state.reserve_recovery_active = False
@@ -1540,10 +1573,12 @@ class AutoswapBot:
         if action.sell_symbol == CC_SYMBOL and action.buy_symbol == "USDCx":
             strategy_state.strategy_4_topup_pending_recycle = True
             strategy_state.strategy_4_topup_after_foreign_minimum = False
+            strategy_state.strategy_4_topup_settlement_wait_retries = 0
             return
         if action.sell_symbol in {"USDCx", "CBTC"}:
             strategy_state.strategy_4_topup_pending_recycle = False
             strategy_state.strategy_4_topup_after_foreign_minimum = False
+            strategy_state.strategy_4_topup_settlement_wait_retries = 0
 
     def _is_balance_blocking_stop_reason(self, stop_reason: str | None) -> bool:
         """Check if stop reason indicates a genuine balance shortage.
@@ -1613,6 +1648,7 @@ class AutoswapBot:
                     # and goes straight to CC->USDCx topup
                     strategy_state.strategy_4_topup_after_foreign_minimum = True
                     strategy_state.strategy_4_topup_pending_recycle = False
+                    strategy_state.strategy_4_topup_settlement_wait_retries = 0
                     return RoundExecutionResult(
                         completed=False,
                         tx_count=tx_count,
@@ -1665,6 +1701,18 @@ class AutoswapBot:
         if self._strategy_4_has_cc_topup_capacity(account=account, monitor_card=monitor_card):
             strategy_state.strategy_4_min_ticket_consecutive = 0
             self._reset_balance_block_counter(strategy_state)
+            if strategy_state.strategy_4_topup_pending_recycle:
+                await self.monitor.log_event(
+                    monitor_card,
+                    f"ℹ️ Round {round_number} pending: waiting previous CC top-up settlement",
+                    force=True,
+                )
+                return RoundExecutionResult(
+                    completed=False,
+                    tx_count=tx_count,
+                    stop_reason=stop_reason,
+                    skipped=True,
+                )
             strategy_state.strategy_4_topup_after_foreign_minimum = True
             logger.info(
                 "Saldo akun %s masih cukup untuk top-up CC->USDCx, tidak dihentikan sebagai saldo kurang",
@@ -3125,6 +3173,74 @@ class AutoswapBot:
                 remaining[symbol] = amount
         return remaining
 
+    async def _classify_recovery_blocker(
+        self,
+        *,
+        router: RouteOptimizer,
+        balances: dict[str, Decimal],
+        source_symbols: tuple[str, ...],
+        target_symbol: str,
+        cc_reserve: Decimal,
+    ) -> tuple[str, str]:
+        insufficient_fee_symbols: list[str] = []
+        terminal_reasons: list[str] = []
+        candidate_count = 0
+
+        for source_symbol in source_symbols:
+            available_amount = self._spendable_amount(
+                source_symbol,
+                balances.get(source_symbol, Decimal("0")),
+                cc_reserve,
+            )
+            if available_amount <= dust_for_symbol(source_symbol):
+                continue
+
+            recovery_amount, min_ticket_reason = await self._normalize_amount_for_min_ticket(
+                router=router,
+                sell_symbol=source_symbol,
+                buy_symbol=target_symbol,
+                desired_amount=available_amount,
+                max_available_amount=available_amount,
+            )
+            if recovery_amount is None:
+                terminal_reasons.append(f"{source_symbol}: {min_ticket_reason}")
+                continue
+
+            candidate_count += 1
+            try:
+                _, issue = await self._prepare_affordable_route(
+                    router=router,
+                    balances=balances,
+                    sell_symbol=source_symbol,
+                    buy_symbol=target_symbol,
+                    proposed_amount=recovery_amount,
+                    round_number=0,
+                    cc_reserve=cc_reserve,
+                )
+            except RuntimeError as exc:
+                if self._is_retryable_route_error(exc):
+                    return "wait", f"transient quote error ({exc})"
+                raise
+
+            if issue is None:
+                return "wait", f"{source_symbol}->{target_symbol} route masih tersedia"
+            if issue.reason == "balance fee tidak cukup":
+                insufficient_fee_symbols.append(source_symbol)
+                continue
+            terminal_reasons.append(f"{source_symbol}: {issue.reason}")
+
+        if insufficient_fee_symbols and not terminal_reasons:
+            return (
+                "insufficient_cc_gas",
+                "CC gas tidak cukup untuk recovery "
+                + ", ".join(sorted(insufficient_fee_symbols)),
+            )
+        if terminal_reasons:
+            return "terminal", "; ".join(terminal_reasons)
+        if candidate_count <= 0:
+            return "terminal", "tidak ada source recovery yang lolos min-ticket"
+        return "wait", "menunggu fee/slippage/quote recovery membaik"
+
     async def _perform_weekly_refill_to_cc(
         self,
         *,
@@ -3151,7 +3267,10 @@ class AutoswapBot:
 
         total_tx = 0
         refill_complete = True
+        refill_stop_reason = ""
         while True:
+            self._raise_if_stop_requested()
+            await self._pause_if_requested()
             balances = self._balances_by_symbol(await sdk.get_account_info())
             remaining = self._non_cc_balances_remaining(balances)
             if not remaining:
@@ -3167,23 +3286,59 @@ class AutoswapBot:
                 monitor_card=monitor_card,
                 used_network_fee=used_network_fee,
                 used_swap_fee=used_swap_fee,
+                source_symbols=tuple(remaining.keys()),
             )
             total_tx += recovered_tx
-            if recovered_tx <= 0:
-                refill_complete = False
-                logger.warning(
-                    "Weekly refill belum bisa mengosongkan token non-CC: %s",
+            if recovered_tx > 0:
+                continue
+
+            balances = self._balances_by_symbol(await sdk.get_account_info())
+            remaining = self._non_cc_balances_remaining(balances)
+            if not remaining:
+                break
+
+            blocker_kind, blocker_reason = await self._classify_recovery_blocker(
+                router=router,
+                balances=balances,
+                source_symbols=tuple(remaining.keys()),
+                target_symbol=CC_SYMBOL,
+                cc_reserve=Decimal("0"),
+            )
+            if blocker_kind == "wait":
+                wait_seconds = self._sample_network_fee_poll_seconds()
+                logger.info(
+                    "Weekly refill wait and retry | remaining=%s | reason=%s | next=%.0fs",
                     self._format_amount_map(remaining),
+                    blocker_reason,
+                    wait_seconds,
                 )
                 await self.monitor.log_event(
                     monitor_card,
                     (
-                        "⚠️ Weekly refill stopped: token non-CC tersisa "
-                        f"{self._format_amount_map(remaining)}"
+                        "⏳ Weekly refill waiting retry: "
+                        f"{self._format_amount_map(remaining)} | {blocker_reason}"
                     ),
                     force=True,
                 )
-                break
+                await self._sleep_or_stop(wait_seconds)
+                continue
+
+            refill_complete = False
+            refill_stop_reason = blocker_reason
+            logger.warning(
+                "Weekly refill berhenti dengan sisa non-CC | remaining=%s | reason=%s",
+                self._format_amount_map(remaining),
+                blocker_reason,
+            )
+            await self.monitor.log_event(
+                monitor_card,
+                (
+                    "⚠️ Weekly refill stopped: token non-CC tersisa "
+                    f"{self._format_amount_map(remaining)} | {blocker_reason}"
+                ),
+                force=True,
+            )
+            break
 
         result.swap_transactions += total_tx
         result.stop_reason = "WEEKLY_REFILL_COMPLETE" if refill_complete else "WEEKLY_REFILL_INCOMPLETE"
@@ -3193,6 +3348,8 @@ class AutoswapBot:
                 f"✅ Weekly refill complete: {total_tx} refill swap(s)",
                 force=True,
             )
+        elif refill_stop_reason:
+            logger.warning("Weekly refill incomplete | reason=%s", refill_stop_reason)
 
     async def _strategy_4_refill_non_cc_to_cc(
         self,
@@ -4925,11 +5082,9 @@ class AutoswapBot:
                                 result.validator_tx_count,
                                 result.avg_fee_per_swap,
                             )
-                            await self.monitor.update_ccview_fee(
-                                monitor_card,
-                                validator_fee_total=result.validator_fee_total,
-                                validator_tx_count=result.validator_tx_count,
-                                avg_fee_per_swap=result.avg_fee_per_swap,
+                            await self._apply_ccview_result_to_card(
+                                monitor_card=monitor_card,
+                                result=result,
                             )
                             return
 
@@ -4988,11 +5143,9 @@ class AutoswapBot:
         )
 
         if result is not None and result.success and monitor_card is not None:
-            await self.monitor.update_ccview_fee(
-                monitor_card,
-                validator_fee_total=result.validator_fee_total,
-                validator_tx_count=result.validator_tx_count,
-                avg_fee_per_swap=result.avg_fee_per_swap,
+            await self._apply_ccview_result_to_card(
+                monitor_card=monitor_card,
+                result=result,
             )
             self.log.debug(
                 "CCView sync update applied | %s | fee=%s | tx=%s | avg=%s",
@@ -5034,11 +5187,9 @@ class AutoswapBot:
                         force=True,
                     )
                     if result is not None and result.success:
-                        await self.monitor.update_ccview_fee(
-                            monitor_card,
-                            validator_fee_total=result.validator_fee_total,
-                            validator_tx_count=result.validator_tx_count,
-                            avg_fee_per_swap=result.avg_fee_per_swap,
+                        await self._apply_ccview_result_to_card(
+                            monitor_card=monitor_card,
+                            result=result,
                         )
                         self.log.info(
                             "CCView progress scrape applied | account=%s | round=%s | reason=%s | attempt=%s | fee=%s | tx=%s | avg=%s",
@@ -5105,11 +5256,9 @@ class AutoswapBot:
                         result.validator_tx_count,
                         result.avg_fee_per_swap,
                     )
-                    await self.monitor.update_ccview_fee(
-                        monitor_card,
-                        validator_fee_total=result.validator_fee_total,
-                        validator_tx_count=result.validator_tx_count,
-                        avg_fee_per_swap=result.avg_fee_per_swap,
+                    await self._apply_ccview_result_to_card(
+                        monitor_card=monitor_card,
+                        result=result,
                     )
                     return  # Success, stop retrying
                 else:
@@ -6471,14 +6620,18 @@ class AutoswapBot:
             # Scrape ccview fee data
             if info.address:
                 logger.debug("Scraping CCView fee data...")
-                from datetime import date as _date
-                today = _date.today().isoformat()
                 try:
-                    fee_result = await self.fee_scraper.fetch_actual_fee(info.address, today)
+                    fee_result = await self.fee_scraper.fetch_actual_fee_today_and_week(info.address)
                     if fee_result is not None and fee_result.success:
                         card.ccview_validator_fee_total = fee_result.validator_fee_total
                         card.ccview_validator_tx_count = fee_result.validator_tx_count
                         card.ccview_avg_fee_per_swap = fee_result.avg_fee_per_swap
+                        if fee_result.week_validator_fee_total is not None:
+                            card.ccview_week_validator_fee_total = fee_result.week_validator_fee_total
+                        if fee_result.week_validator_tx_count is not None:
+                            card.ccview_week_validator_tx_count = fee_result.week_validator_tx_count
+                        if fee_result.week_avg_fee_per_swap is not None:
+                            card.ccview_week_avg_fee_per_swap = fee_result.week_avg_fee_per_swap
                 except Exception as exc:
                     logger.warning("CCView scrape gagal: %s", exc)
 

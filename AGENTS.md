@@ -306,3 +306,76 @@ Catatan maintenance:
 
 - setting ini hanya berlaku di `_swap_hop_with_retry`
 - jangan dipakai untuk mematikan polling fee route-level atau retry quote untuk validasi harga
+
+## 14. Strategy 4 top-up settlement tidak boleh deadlock
+
+Masalah historis:
+
+- setelah swap top-up `CC -> USDCx` sukses, `strategy_4_topup_pending_recycle` di-set `True`
+- jika balance foreign belum muncul di `get_account_info()`, `_strategy_4_action_candidates` mengembalikan `strategy_4 waiting top-up balance settlement`
+- loop 24h lalu hanya tidur 5 detik dan retry
+- tanpa escape hatch, akun bisa stuck cooldown selamanya
+
+Perilaku yang harus dijaga sekarang:
+
+- `StrategyRuntimeState` punya counter `strategy_4_topup_settlement_wait_retries`
+- selama `strategy_4_topup_pending_recycle=True` dan foreign balance belum terlihat, counter naik
+- selama counter masih `<= MAX_STRATEGY_4_TOPUP_SETTLEMENT_WAIT_RETRIES`, bot tetap menunggu settlement
+- jika limit terlampaui, bot clear `strategy_4_topup_pending_recycle` dan reset counter agar state machine bisa lanjut lagi
+- saat masih pending settlement, `_build_skipped_round_result` TIDAK boleh mengaktifkan `strategy_4_topup_after_foreign_minimum`; kalau tidak, foreign balance yang baru muncul bisa salah dilewati dan recycle tidak jalan
+- setiap sukses swap `CC->USDCx` atau sukses foreign sell (`USDCx/CBTC`), counter settlement wait harus di-reset ke `0`
+
+Saat debug akun strategy 4 yang stuck cooldown:
+
+1. cek apakah log berulang `strategy_4 waiting top-up balance settlement`
+2. cek apakah setelah beberapa retry state pending akhirnya clear
+3. pastikan saat foreign balance akhirnya muncul, bot kembali memilih recycle candidate, bukan langsung top-up lagi
+
+## 15. CCView jadi sumber fee/gas rendered untuk today/week
+
+Masalah historis:
+
+- terminal row `Gas`, terminal summary `Fee paid`, Telegram combined `Gas`, dan Telegram summary tidak memakai sumber data yang sama
+- sebagian memakai accounting internal bot, sebagian memakai scrape ccview
+
+Perilaku yang harus dijaga sekarang:
+
+- `FeeScraper` punya fetch rentang tanggal:
+  - harian: `today -> today`
+  - mingguan: `Monday UTC -> today UTC`
+- hasil scrape sukses membawa dua aggregate sekaligus:
+  - `validator_fee_total` / `validator_tx_count` / `avg_fee_per_swap` untuk hari ini
+  - `week_validator_fee_total` / `week_validator_tx_count` / `week_avg_fee_per_swap` untuk minggu berjalan
+- `TelegramMonitor` menyimpan field ccview today + week di state persisten card/account
+- render `today/week fee paid` di terminal dashboard dan Telegram summary HARUS lewat `_current_day_total_fee()` / `_current_week_total_fee()` yang sekarang memantulkan aggregate ccview, bukan accounting internal bot
+- row/account-level display boleh tetap menampilkan metrik tambahan internal lain, tapi angka `Gas` / `Fee paid today/week` harus konsisten lintas terminal + Telegram
+
+Saat mengubah lagi dashboard fee:
+
+1. jangan campur sumber internal bot dan ccview untuk label yang sama
+2. kalau menambah label `today/week`, pakai aggregate ccview yang sudah ada
+3. kalau scrape week gagal tapi scrape today sukses, jangan mengosongkan state week yang terakhir valid tanpa sengaja
+
+## 16. Weekly refill harus retry terus selama blocker masih transien
+
+Masalah historis:
+
+- `_perform_weekly_refill_to_cc` berhenti pada kegagalan recovery pertama
+- akibatnya weekly refill bisa selesai dengan status incomplete meski penyebabnya cuma fee/slippage/cap sementara
+
+Perilaku yang harus dijaga sekarang:
+
+- weekly refill tetap MEMATUHI:
+  - `max_network_fee_cc_per_execution`
+  - `max_slippage_per_execution`
+- kalau `_recover_to_symbol()` tidak menghasilkan tx, bot HARUS klasifikasikan blocker:
+  - `wait`: fee/slippage/quote masih mungkin membaik, maka tidur sebentar lalu retry lagi
+  - `insufficient_cc_gas`: semua source yang masih layak hanya terblokir `balance fee tidak cukup`, maka boleh stop incomplete
+  - `terminal`: kasus non-transien seperti semua source tersisa di bawah min-ticket / issue balance terminal, maka boleh stop incomplete
+- selama blocker = `wait`, bot tidak boleh declare weekly refill selesai ataupun incomplete; loop harus lanjut sampai saldo non-CC habis atau benar-benar mentok
+
+Saat debug weekly refill yang tampak macet:
+
+1. cek log `Weekly refill waiting retry`
+2. lihat `reason=` dari `_classify_recovery_blocker`
+3. pastikan stop final hanya terjadi pada `insufficient_cc_gas` atau alasan terminal nyata, bukan sekadar fee/slippage tinggi sesaat

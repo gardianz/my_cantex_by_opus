@@ -103,6 +103,9 @@ class TelegramCardState:
     ccview_validator_fee_total: Decimal = field(default_factory=lambda: Decimal("0"))
     ccview_validator_tx_count: int = 0
     ccview_avg_fee_per_swap: Decimal = field(default_factory=lambda: Decimal("0"))
+    ccview_week_validator_fee_total: Decimal = field(default_factory=lambda: Decimal("0"))
+    ccview_week_validator_tx_count: int = 0
+    ccview_week_avg_fee_per_swap: Decimal = field(default_factory=lambda: Decimal("0"))
     message_id: int | None = None
     last_render_text: str | None = None
     last_publish_monotonic: float = 0.0
@@ -126,6 +129,12 @@ class TelegramAccountTotals:
     # Persisted untuk tahan restart: balance start-of-day dan simbol target
     cc_balance_start_of_day: Decimal = field(default_factory=lambda: Decimal("0"))
     daily_loss_symbol: str = "CC"
+    ccview_validator_fee_total: Decimal = field(default_factory=lambda: Decimal("0"))
+    ccview_validator_tx_count: int = 0
+    ccview_avg_fee_per_swap: Decimal = field(default_factory=lambda: Decimal("0"))
+    ccview_week_validator_fee_total: Decimal = field(default_factory=lambda: Decimal("0"))
+    ccview_week_validator_tx_count: int = 0
+    ccview_week_avg_fee_per_swap: Decimal = field(default_factory=lambda: Decimal("0"))
     lifetime_network_fee: dict[str, Decimal] = field(default_factory=dict)
     lifetime_swap_fee: dict[str, Decimal] = field(default_factory=dict)
 
@@ -304,6 +313,12 @@ class TelegramMonitor:
             # tapi jika hari masih sama, nilai persisted ini yang dipakai untuk hitung CyLoss.
             cc_balance_start_of_day=persisted.cc_balance_start_of_day,
             daily_loss_symbol=persisted.daily_loss_symbol or "CC",
+            ccview_validator_fee_total=persisted.ccview_validator_fee_total,
+            ccview_validator_tx_count=persisted.ccview_validator_tx_count,
+            ccview_avg_fee_per_swap=persisted.ccview_avg_fee_per_swap,
+            ccview_week_validator_fee_total=persisted.ccview_week_validator_fee_total,
+            ccview_week_validator_tx_count=persisted.ccview_week_validator_tx_count,
+            ccview_week_avg_fee_per_swap=persisted.ccview_week_avg_fee_per_swap,
         )
         self._cards[account.name] = card
         self._persist_card_state(card)
@@ -562,14 +577,25 @@ class TelegramMonitor:
         validator_fee_total: Decimal,
         validator_tx_count: int,
         avg_fee_per_swap: Decimal,
+        week_validator_fee_total: Decimal | None = None,
+        week_validator_tx_count: int | None = None,
+        week_avg_fee_per_swap: Decimal | None = None,
         force: bool = True,
     ) -> None:
         """Update card with actual fee data from ccview.io scraper."""
         if card is None:
             return
+        self._rollover_card_if_needed(card)
         card.ccview_validator_fee_total = validator_fee_total
         card.ccview_validator_tx_count = validator_tx_count
         card.ccview_avg_fee_per_swap = avg_fee_per_swap
+        if week_validator_fee_total is not None:
+            card.ccview_week_validator_fee_total = week_validator_fee_total
+        if week_validator_tx_count is not None:
+            card.ccview_week_validator_tx_count = max(int(week_validator_tx_count), 0)
+        if week_avg_fee_per_swap is not None:
+            card.ccview_week_avg_fee_per_swap = week_avg_fee_per_swap
+        self._persist_card_state(card)
         await self._refresh_outputs(card, force=force)
 
     async def record_tx_success(
@@ -883,6 +909,7 @@ class TelegramMonitor:
         this_week_total = self._aggregate_rebate_total(cards, "this_week")
         distributed_total = self._aggregate_distributed_total(cards)
         paid_fee_today = self._aggregate_current_day_total_fee(cards)
+        paid_fee_week = self._aggregate_current_week_total_fee(cards)
         fee_cap = self.runtime.max_network_fee_cc_per_execution
         fee_cap_text = f"{fee_cap}" if fee_cap is not None else "-"
         return [
@@ -909,7 +936,11 @@ class TelegramMonitor:
                 row_width,
             ),
             self._padded_line(
-                f"Fee paid: {self._format_amount_map_display(paid_fee_today)}",
+                (
+                    "Fee paid: "
+                    f"T {self._format_amount_map_display(paid_fee_today)} | "
+                    f"W {self._format_amount_map_display(paid_fee_week)}"
+                ),
                 row_width,
             ),
             self._padded_line(
@@ -1052,8 +1083,8 @@ class TelegramMonitor:
         return f"{card.daily_free_fee_used}/{card.daily_free_fee_limit}"
 
     def _ccview_fee_compact(self, card: TelegramCardState) -> str:
-        """Compact ccview actual fee display: avg_fee (tx_count tx)."""
-        if card.ccview_validator_tx_count <= 0:
+        """Compact ccview display: avg fee per tx + today tx count."""
+        if card.ccview_validator_tx_count <= 0 or card.ccview_avg_fee_per_swap <= Decimal("0"):
             return "-"
         avg_text = format(card.ccview_avg_fee_per_swap, ".4f").rstrip("0").rstrip(".")
         return f"{avg_text} CC/tx ({card.ccview_validator_tx_count}tx)"
@@ -1300,7 +1331,7 @@ class TelegramMonitor:
             html.escape(f"💰 Reward distributed total: {self._format_cc_total(distributed_total)}"),
             html.escape(f"Funding total (excl rewards/rebates): {self._format_cc_total(funding_total)}"),
             html.escape(
-                "💸 Fee paid total (today | week, excl free): "
+                "💸 Fee paid total (today | week, ccview): "
                 f"{self._format_amount_map_display(paid_fee_today)} | "
                 f"{self._format_amount_map_display(paid_fee_week)}"
             ),
@@ -1351,7 +1382,8 @@ class TelegramMonitor:
         this_week_rebate = self._rebate_amount(summary.rebates.get("this_week")) if summary else "-"
         distributed_rebate = self._distributed_amount(summary.distributed_reward) if summary else "-"
         funding_total = self._funding_amount(summary.funding_total) if summary else "-"
-        daily_fee_spent = self._format_amount_map_display(self._current_day_network_fee(card))
+        daily_fee_spent = self._format_amount_map_display(self._current_day_total_fee(card))
+        weekly_fee_spent = self._format_amount_map_display(self._current_week_total_fee(card))
         activity_24h = self._dashboard_24h_activity(summary)
         progress = self._dashboard_progress(card)
         plan = self._combined_plan(card)
@@ -1379,6 +1411,7 @@ class TelegramMonitor:
                         f"Dist {distributed_rebate}",
                         f"Fund {funding_total}",
                         f"Gas {daily_fee_spent}",
+                        f"FeeW {weekly_fee_spent}",
                         f"Free {card.daily_free_fee_used}/{card.daily_free_fee_limit}",
                         f"CCView {self._ccview_fee_compact(card)}",
                     ]
@@ -1499,24 +1532,20 @@ class TelegramMonitor:
         )
 
     def _build_gas_totals_line(self, card: TelegramCardState) -> str:
-        total_daily_fee = self._current_day_network_fee(card)
-        total_lifetime_fee = self._current_lifetime_network_fee(card)
+        total_daily_fee = self._current_day_total_fee(card)
+        total_week_fee = self._current_week_total_fee(card)
         return (
             f"Gas Fee Hari Ini: {self._format_amount_map(total_daily_fee)} | "
-            f"Total Gas Fee Dibayar: {self._format_amount_map(total_lifetime_fee)}"
+            f"Gas Fee Minggu Ini: {self._format_amount_map(total_week_fee)}"
         )
 
     def _build_fee_line(self, card: TelegramCardState) -> str:
         today_fee = self._current_day_total_fee(card)
         week_fee = self._current_week_total_fee(card)
-        total_fee = self._merge_amount_maps(
-            self._current_lifetime_network_fee(card),
-            self._current_lifetime_swap_fee(card),
-        )
         return (
             f"Fees: Today {self._format_amount_map(today_fee)} | "
             f"Week {self._format_amount_map(week_fee)} | "
-            f"Total {self._format_amount_map(total_fee)}"
+            f"CCView {self._ccview_fee_compact(card)}"
         )
 
     def _build_swaps_line(self, card: TelegramCardState) -> str:
@@ -1900,6 +1929,11 @@ class TelegramMonitor:
             parts.append(f"{SYMBOL_SHORT.get(symbol, symbol)} {rendered}")
         return ", ".join(parts) if parts else "-"
 
+    def _ccview_amount_map(self, total_fee: Decimal) -> dict[str, Decimal]:
+        if total_fee <= Decimal("0"):
+            return {}
+        return {"CC": total_fee}
+
     def _merge_amount_maps(
         self,
         left: dict[str, Decimal],
@@ -1964,16 +1998,10 @@ class TelegramMonitor:
         )
 
     def _current_day_total_fee(self, card: TelegramCardState) -> dict[str, Decimal]:
-        return self._merge_amount_maps(
-            self._current_day_network_fee(card),
-            self._current_day_swap_fee(card),
-        )
+        return self._ccview_amount_map(card.ccview_validator_fee_total)
 
     def _current_week_total_fee(self, card: TelegramCardState) -> dict[str, Decimal]:
-        return self._merge_amount_maps(
-            self._current_week_network_fee(card),
-            self._current_week_swap_fee(card),
-        )
+        return self._ccview_amount_map(card.ccview_week_validator_fee_total)
 
     def _aggregate_current_day_total_fee(self, cards: list[TelegramCardState]) -> dict[str, Decimal]:
         merged: dict[str, Decimal] = {}
@@ -2105,6 +2133,30 @@ class TelegramMonitor:
                 loaded_start_balance = Decimal(str(payload.get("cc_balance_start_of_day", "0")))
             except Exception:
                 loaded_start_balance = Decimal("0")
+            try:
+                ccview_validator_fee_total = Decimal(
+                    str(payload.get("ccview_validator_fee_total", "0"))
+                )
+            except Exception:
+                ccview_validator_fee_total = Decimal("0")
+            try:
+                ccview_avg_fee_per_swap = Decimal(
+                    str(payload.get("ccview_avg_fee_per_swap", "0"))
+                )
+            except Exception:
+                ccview_avg_fee_per_swap = Decimal("0")
+            try:
+                ccview_week_validator_fee_total = Decimal(
+                    str(payload.get("ccview_week_validator_fee_total", "0"))
+                )
+            except Exception:
+                ccview_week_validator_fee_total = Decimal("0")
+            try:
+                ccview_week_avg_fee_per_swap = Decimal(
+                    str(payload.get("ccview_week_avg_fee_per_swap", "0"))
+                )
+            except Exception:
+                ccview_week_avg_fee_per_swap = Decimal("0")
             self._account_totals[account_name] = TelegramAccountTotals(
                 current_utc_date=current_utc_date,
                 current_utc_week=current_utc_week,
@@ -2123,6 +2175,15 @@ class TelegramMonitor:
                 lifetime_swap_fee=self._deserialize_amount_map(payload.get("lifetime_swap_fee")),
                 cc_balance_start_of_day=loaded_start_balance,
                 daily_loss_symbol=str(payload.get("daily_loss_symbol", "CC")) or "CC",
+                ccview_validator_fee_total=ccview_validator_fee_total,
+                ccview_validator_tx_count=max(int(payload.get("ccview_validator_tx_count", 0)), 0),
+                ccview_avg_fee_per_swap=ccview_avg_fee_per_swap,
+                ccview_week_validator_fee_total=ccview_week_validator_fee_total,
+                ccview_week_validator_tx_count=max(
+                    int(payload.get("ccview_week_validator_tx_count", 0)),
+                    0,
+                ),
+                ccview_week_avg_fee_per_swap=ccview_week_avg_fee_per_swap,
             )
         self._normalize_all_accounts()
 
@@ -2161,6 +2222,12 @@ class TelegramMonitor:
             totals.daily_swap_fee = {}
             totals.weekly_network_fee = {}
             totals.weekly_swap_fee = {}
+            totals.ccview_validator_fee_total = Decimal("0")
+            totals.ccview_validator_tx_count = 0
+            totals.ccview_avg_fee_per_swap = Decimal("0")
+            totals.ccview_week_validator_fee_total = Decimal("0")
+            totals.ccview_week_validator_tx_count = 0
+            totals.ccview_week_avg_fee_per_swap = Decimal("0")
             return totals
         day_gap = (today - recorded_date).days
         if day_gap > 0:
@@ -2174,12 +2241,18 @@ class TelegramMonitor:
             # Reset balance start-of-day saat hari berganti.
             # Bot akan set ulang via set_cc_balance_start_of_day saat startup hari baru.
             totals.cc_balance_start_of_day = Decimal("0")
+            totals.ccview_validator_fee_total = Decimal("0")
+            totals.ccview_validator_tx_count = 0
+            totals.ccview_avg_fee_per_swap = Decimal("0")
         elif day_gap < 0:
             totals.current_utc_date = today_str
         if totals.current_utc_week != today_week:
             totals.current_utc_week = today_week
             totals.weekly_network_fee = {}
             totals.weekly_swap_fee = {}
+            totals.ccview_week_validator_fee_total = Decimal("0")
+            totals.ccview_week_validator_tx_count = 0
+            totals.ccview_week_avg_fee_per_swap = Decimal("0")
         return totals
 
     def _sanitize_loaded_network_fee(
@@ -2235,6 +2308,9 @@ class TelegramMonitor:
             card.cycle_count = 0
             card.daily_cc_loss = Decimal("0")
             card.daily_cc_loss_set = False
+            card.ccview_validator_fee_total = Decimal("0")
+            card.ccview_validator_tx_count = 0
+            card.ccview_avg_fee_per_swap = Decimal("0")
             changed = True
         if card.current_utc_week != today_week:
             card.current_utc_week = today_week
@@ -2243,6 +2319,9 @@ class TelegramMonitor:
             card.week_session_network_fee_offset = dict(card.total_network_fee)
             card.week_session_free_network_fee_offset = dict(card.free_network_fee_credit)
             card.week_session_swap_fee_offset = dict(card.total_swap_fee)
+            card.ccview_week_validator_fee_total = Decimal("0")
+            card.ccview_week_validator_tx_count = 0
+            card.ccview_week_avg_fee_per_swap = Decimal("0")
             changed = True
         if changed:
             self._persist_card_state(card)
@@ -2267,12 +2346,18 @@ class TelegramMonitor:
         # Persist balance start-of-day agar tahan restart
         totals.cc_balance_start_of_day = card.cc_balance_start_of_day
         totals.daily_loss_symbol = card.daily_loss_symbol or "CC"
+        totals.ccview_validator_fee_total = card.ccview_validator_fee_total
+        totals.ccview_validator_tx_count = card.ccview_validator_tx_count
+        totals.ccview_avg_fee_per_swap = card.ccview_avg_fee_per_swap
+        totals.ccview_week_validator_fee_total = card.ccview_week_validator_fee_total
+        totals.ccview_week_validator_tx_count = card.ccview_week_validator_tx_count
+        totals.ccview_week_avg_fee_per_swap = card.ccview_week_avg_fee_per_swap
         self._account_totals[card.account_name] = totals
         self._save_state()
 
     def _save_state(self) -> None:
         payload = {
-            "version": 3,
+            "version": 4,
             "accounts": {
                 account_name: {
                     "current_utc_date": totals.current_utc_date,
@@ -2292,6 +2377,12 @@ class TelegramMonitor:
                     "lifetime_swap_fee": self._serialize_amount_map(totals.lifetime_swap_fee),
                     "cc_balance_start_of_day": str(totals.cc_balance_start_of_day),
                     "daily_loss_symbol": totals.daily_loss_symbol or "CC",
+                    "ccview_validator_fee_total": str(totals.ccview_validator_fee_total),
+                    "ccview_validator_tx_count": totals.ccview_validator_tx_count,
+                    "ccview_avg_fee_per_swap": str(totals.ccview_avg_fee_per_swap),
+                    "ccview_week_validator_fee_total": str(totals.ccview_week_validator_fee_total),
+                    "ccview_week_validator_tx_count": totals.ccview_week_validator_tx_count,
+                    "ccview_week_avg_fee_per_swap": str(totals.ccview_week_avg_fee_per_swap),
                 }
                 for account_name, totals in sorted(self._account_totals.items())
             },

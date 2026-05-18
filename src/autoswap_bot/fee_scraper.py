@@ -18,7 +18,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 import httpx  # type: ignore[import]
@@ -52,6 +52,9 @@ class ActualFeeResult:
     avg_fee_per_swap: Decimal = field(default_factory=lambda: Decimal("0"))
     swap_tx_count: int = 0
     balance: Decimal = field(default_factory=lambda: Decimal("0"))
+    week_validator_fee_total: Decimal | None = None
+    week_validator_tx_count: int | None = None
+    week_avg_fee_per_swap: Decimal | None = None
     success: bool = False
     error: str | None = None
     scraped_at_utc: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
@@ -159,25 +162,49 @@ class FeeScraper:
 
             return self._client
 
+    def _utc_today_and_week_dates(self) -> tuple[str, str]:
+        today = datetime.now(timezone.utc).date()
+        week_start = today - timedelta(days=today.weekday())
+        return today.isoformat(), week_start.isoformat()
+
     async def fetch_actual_fee(self, party_id: str, date: str) -> ActualFeeResult:
-        """Fetch counterparties data dan extract validator fee.
+        """Fetch counterparties data dan extract validator fee untuk satu hari."""
+        return await self.fetch_actual_fee_range(
+            party_id,
+            start_date=date,
+            end_date=date,
+        )
+
+    async def fetch_actual_fee_range(
+        self,
+        party_id: str,
+        *,
+        start_date: str,
+        end_date: str,
+        include_balance: bool = True,
+    ) -> ActualFeeResult:
+        """Fetch counterparties data dan extract validator fee untuk rentang tanggal.
 
         Args:
             party_id: The party ID (address) of the account on ccview.io
-            date: Date string in YYYY-MM-DD format
+            start_date: Start date YYYY-MM-DD
+            end_date: End date YYYY-MM-DD
+            include_balance: Also fetch party balance detail
 
         Returns:
             ActualFeeResult with validator fee data
         """
-        result = ActualFeeResult(party_id=party_id, date=date)
+        range_label = start_date if start_date == end_date else f"{start_date}..{end_date}"
+        result = ActualFeeResult(party_id=party_id, date=range_label)
 
         try:
             client = await self._ensure_client()
 
             self.log.debug(
-                "CCView fetch_actual_fee | party_id=%s | date=%s",
+                "CCView fetch_actual_fee_range | party_id=%s | start=%s | end=%s",
                 party_id[:30] if party_id else "(empty)",
-                date,
+                start_date,
+                end_date,
             )
 
             # Fetch counterparties
@@ -185,17 +212,18 @@ class FeeScraper:
                 "party_id": party_id,
                 "limit": "50",
                 "offset": "0",
-                "start": date,
-                "end": date,
+                "start": start_date,
+                "end": end_date,
             }
 
             cp_data = await self._fetch_with_retry(client, COUNTERPARTIES_URL, params)
             if cp_data is None:
                 result.error = f"Failed to fetch counterparties (party_id={party_id[:30]})"
                 self.log.warning(
-                    "CCView counterparties returned None | party_id=%s | date=%s",
+                    "CCView counterparties returned None | party_id=%s | start=%s | end=%s",
                     party_id[:30] if party_id else "(empty)",
-                    date,
+                    start_date,
+                    end_date,
                 )
                 return result
 
@@ -246,28 +274,67 @@ class FeeScraper:
             result.success = True
 
             # Optionally fetch balance
-            try:
-                balance_data = await self._fetch_with_retry(
-                    client, f"{PARTY_INFO_URL}/{party_id}", {}
-                )
-                if balance_data is not None:
-                    balance_info = balance_data.get("balance", {})
-                    if isinstance(balance_info, dict):
-                        result.balance = Decimal(
-                            str(
-                                balance_info.get("total_coin_holdings")
-                                or balance_info.get("total_available_coin")
-                                or "0"
+            if include_balance:
+                try:
+                    balance_data = await self._fetch_with_retry(
+                        client, f"{PARTY_INFO_URL}/{party_id}", {}
+                    )
+                    if balance_data is not None:
+                        balance_info = balance_data.get("balance", {})
+                        if isinstance(balance_info, dict):
+                            result.balance = Decimal(
+                                str(
+                                    balance_info.get("total_coin_holdings")
+                                    or balance_info.get("total_available_coin")
+                                    or "0"
+                                )
                             )
-                        )
-            except Exception:
-                pass  # Balance is optional
+                except Exception:
+                    pass  # Balance is optional
 
         except Exception as exc:
             result.error = str(exc)
             self.log.warning("Fee scrape failed for %s: %s", party_id[:20], exc)
 
         return result
+
+    async def fetch_actual_fee_today_and_week(self, party_id: str) -> ActualFeeResult:
+        """Fetch today + Monday→today aggregates in one logical scrape result."""
+        today, week_start = self._utc_today_and_week_dates()
+        today_result = await self.fetch_actual_fee_range(
+            party_id,
+            start_date=today,
+            end_date=today,
+            include_balance=True,
+        )
+        if not today_result.success:
+            return today_result
+
+        if week_start == today:
+            today_result.week_validator_fee_total = today_result.validator_fee_total
+            today_result.week_validator_tx_count = today_result.validator_tx_count
+            today_result.week_avg_fee_per_swap = today_result.avg_fee_per_swap
+            return today_result
+
+        week_result = await self.fetch_actual_fee_range(
+            party_id,
+            start_date=week_start,
+            end_date=today,
+            include_balance=False,
+        )
+        if week_result.success:
+            today_result.week_validator_fee_total = week_result.validator_fee_total
+            today_result.week_validator_tx_count = week_result.validator_tx_count
+            today_result.week_avg_fee_per_swap = week_result.avg_fee_per_swap
+        else:
+            self.log.warning(
+                "CCView weekly aggregate scrape failed | party_id=%s | start=%s | end=%s | error=%s",
+                party_id[:30] if party_id else "(empty)",
+                week_start,
+                today,
+                week_result.error,
+            )
+        return today_result
 
     async def _fetch_with_retry(
         self,
@@ -367,7 +434,6 @@ class FeeScraper:
             # Wait a bit for ccview.io to index the transaction
             await asyncio.sleep(SCRAPE_DELAY_AFTER_SWAP_SECONDS)
 
-            today = datetime.now(timezone.utc).date().isoformat()
             # [GAS DIAG] track wait di scrape lock — bila banyak akun antre,
             # akan terlihat selisih waktu antara mulai await dan dapat lock.
             wait_start = time.monotonic()
@@ -379,7 +445,7 @@ class FeeScraper:
                         wait_elapsed,
                         account_name,
                     )
-                result = await self.fetch_actual_fee(party_id, today)
+                result = await self.fetch_actual_fee_today_and_week(party_id)
 
             self._latest_results[account_name] = result
 
@@ -456,30 +522,29 @@ class FeeScraper:
     ) -> None:
         """Startup scrape — no delay, immediate fetch for today's data."""
         try:
-            today = datetime.now(timezone.utc).date().isoformat()
             async with self._scrape_lock:
-                result = await self.fetch_actual_fee(party_id, today)
+                result = await self.fetch_actual_fee_today_and_week(party_id)
 
             self._latest_results[account_name] = result
 
             if result.success:
                 self._last_scrape_time[account_name] = time.monotonic()
                 self.log.info(
-                    "CCView startup scrape OK | %s | date=%s | "
-                    "validator_fee=%s CC (%s tx) | avg=%s CC/swap | swaps=%s",
+                    "CCView startup scrape OK | %s | "
+                    "today_fee=%s CC (%s tx) | week_fee=%s CC (%s tx) | avg=%s CC/swap | swaps=%s",
                     account_name,
-                    today,
                     result.validator_fee_total,
                     result.validator_tx_count,
+                    result.week_validator_fee_total,
+                    result.week_validator_tx_count,
                     result.avg_fee_per_swap,
                     result.swap_tx_count,
                 )
                 self._notify_result(account_name, result)
             else:
                 self.log.warning(
-                    "CCView startup scrape failed | %s | date=%s | error=%s",
+                    "CCView startup scrape failed | %s | error=%s",
                     account_name,
-                    today,
                     result.error,
                 )
         except asyncio.CancelledError:
@@ -533,18 +598,19 @@ class FeeScraper:
             while True:
                 await asyncio.sleep(PERIODIC_SCRAPE_INTERVAL_SECONDS)
                 try:
-                    today = datetime.now(timezone.utc).date().isoformat()
                     async with self._scrape_lock:
-                        result = await self.fetch_actual_fee(party_id, today)
+                        result = await self.fetch_actual_fee_today_and_week(party_id)
                     if result.success:
                         self._latest_results[account_name] = result
                         self._last_scrape_time[account_name] = time.monotonic()
                         self.log.info(
                             "CCView periodic scrape OK | %s | "
-                            "validator_fee=%s CC (%s tx) | avg=%s CC/swap",
+                            "today_fee=%s CC (%s tx) | week_fee=%s CC (%s tx) | avg=%s CC/swap",
                             account_name,
                             result.validator_fee_total,
                             result.validator_tx_count,
+                            result.week_validator_fee_total,
+                            result.week_validator_tx_count,
                             result.avg_fee_per_swap,
                         )
                         # Pastikan dashboard card juga ikut refresh dari periodic.
@@ -596,18 +662,19 @@ class FeeScraper:
             await asyncio.sleep(3.0 - (now - last_time))
 
         try:
-            today = datetime.now(timezone.utc).date().isoformat()
             async with self._scrape_lock:
-                result = await self.fetch_actual_fee(party_id, today)
+                result = await self.fetch_actual_fee_today_and_week(party_id)
 
             if result.success:
                 self._latest_results[account_name] = result
                 self._last_scrape_time[account_name] = time.monotonic()
                 self.log.info(
-                    "CCView scrape_now OK | %s | fee=%s CC (%s tx) | avg=%s CC/swap",
+                    "CCView scrape_now OK | %s | today_fee=%s CC (%s tx) | week_fee=%s CC (%s tx) | avg=%s CC/swap",
                     account_name,
                     result.validator_fee_total,
                     result.validator_tx_count,
+                    result.week_validator_fee_total,
+                    result.week_validator_tx_count,
                     result.avg_fee_per_swap,
                 )
                 self._notify_result(account_name, result)
