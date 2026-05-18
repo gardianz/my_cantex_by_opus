@@ -2986,6 +2986,8 @@ class AutoswapBot:
         last_balances = self._balances_by_symbol(await sdk.get_account_info())
 
         while True:
+            self._raise_if_stop_requested()
+            await self._pause_if_requested()
             spendable = self._spendable_amount(
                 target_symbol,
                 last_balances.get(target_symbol, Decimal("0")),
@@ -2993,6 +2995,10 @@ class AutoswapBot:
             )
             if spendable >= required_amount:
                 return total_tx, last_balances, True
+
+            remaining = self._non_target_balances_remaining(last_balances, target_symbol)
+            if not remaining:
+                return total_tx, last_balances, False
 
             recovered_tx = await self._recover_to_symbol(
                 sdk=sdk,
@@ -3004,10 +3010,59 @@ class AutoswapBot:
                 monitor_card=monitor_card,
                 used_network_fee=used_network_fee,
                 used_swap_fee=used_swap_fee,
+                source_symbols=tuple(remaining.keys()),
             )
             total_tx += recovered_tx
             if recovered_tx <= 0:
-                return total_tx, last_balances, False
+                refreshed_balances = self._balances_by_symbol(await sdk.get_account_info())
+                refreshed_spendable = self._spendable_amount(
+                    target_symbol,
+                    refreshed_balances.get(target_symbol, Decimal("0")),
+                    cc_reserve,
+                )
+                if refreshed_spendable >= required_amount:
+                    return total_tx, refreshed_balances, True
+
+                remaining = self._non_target_balances_remaining(refreshed_balances, target_symbol)
+                if not remaining:
+                    return total_tx, refreshed_balances, False
+
+                blocker_kind, blocker_reason = await self._classify_recovery_blocker(
+                    router=router,
+                    balances=refreshed_balances,
+                    source_symbols=tuple(remaining.keys()),
+                    target_symbol=target_symbol,
+                    cc_reserve=cc_reserve,
+                )
+                if blocker_kind == "wait":
+                    wait_seconds = self._sample_network_fee_poll_seconds()
+                    logger.info(
+                        "Recovery refill %s wait and retry | target=%s | remaining=%s | reason=%s | next=%.0fs",
+                        account_name,
+                        target_symbol,
+                        self._format_amount_map(remaining),
+                        blocker_reason,
+                        wait_seconds,
+                    )
+                    await self.monitor.log_event(
+                        monitor_card,
+                        (
+                            f"⏳ Refill {target_symbol} waiting retry: "
+                            f"{self._format_amount_map(remaining)} | {blocker_reason}"
+                        ),
+                        force=True,
+                    )
+                    await self._sleep_or_stop(wait_seconds)
+                    last_balances = refreshed_balances
+                    continue
+                logger.info(
+                    "Recovery refill %s berhenti | target=%s | remaining=%s | reason=%s",
+                    account_name,
+                    target_symbol,
+                    self._format_amount_map(remaining),
+                    blocker_reason,
+                )
+                return total_tx, refreshed_balances, False
 
             updated_balances = await self._wait_for_balance_settlement(
                 sdk=sdk,
@@ -3019,7 +3074,28 @@ class AutoswapBot:
                 monitor_card=monitor_card,
             )
             if updated_balances == last_balances:
-                return total_tx, updated_balances, False
+                wait_seconds = self._sample_network_fee_poll_seconds()
+                logger.info(
+                    "Recovery refill settlement belum berubah | target=%s | wait=%.0fs",
+                    target_symbol,
+                    wait_seconds,
+                )
+                await self.monitor.log_event(
+                    monitor_card,
+                    f"⏳ Refill {target_symbol} settlement pending, retry {int(wait_seconds)}s",
+                    force=True,
+                )
+                await self._sleep_or_stop(wait_seconds)
+                refreshed_balances = self._balances_by_symbol(await sdk.get_account_info())
+                refreshed_spendable = self._spendable_amount(
+                    target_symbol,
+                    refreshed_balances.get(target_symbol, Decimal("0")),
+                    cc_reserve,
+                )
+                if refreshed_spendable >= required_amount:
+                    return total_tx, refreshed_balances, True
+                last_balances = refreshed_balances
+                continue
             last_balances = updated_balances
 
     async def _wait_for_balance_settlement(

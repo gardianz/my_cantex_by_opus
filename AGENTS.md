@@ -373,6 +373,10 @@ Perilaku yang harus dijaga sekarang:
   - `insufficient_cc_gas`: semua source yang masih layak hanya terblokir `balance fee tidak cukup`, maka boleh stop incomplete
   - `terminal`: kasus non-transien seperti semua source tersisa di bawah min-ticket / issue balance terminal, maka boleh stop incomplete
 - selama blocker = `wait`, bot tidak boleh declare weekly refill selesai ataupun incomplete; loop harus lanjut sampai saldo non-CC habis atau benar-benar mentok
+- pola retry yang sama juga berlaku untuk helper refill source `CC` di tengah round:
+  - `_recover_until_target_available`
+  - `_refill_cc_for_source_step`
+  - jadi ketika bot sedang mencoba menambah saldo `CC` agar source step bisa jalan, ia tidak boleh gagal permanen hanya karena miss transien pertama
 
 Saat debug weekly refill yang tampak macet:
 
